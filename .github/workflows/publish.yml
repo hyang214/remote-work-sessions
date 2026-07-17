@@ -1,0 +1,55 @@
+name: Publish npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish npm
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Fetch reviewed public main
+        run: git fetch origin main:refs/remotes/origin/main --no-tags
+      - name: Use Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Require trusted-publishing npm version
+        run: |
+          node - <<'NODE'
+          const { execFileSync } = require('node:child_process');
+          const version = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim();
+          const [major, minor, patch] = version.split('.').map(Number);
+          if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
+            throw new Error(`npm ${version} does not support trusted publishing; require npm >=11.5.1`);
+          }
+          NODE
+      - name: Require release commit on reviewed public main
+        run: scripts/verify-publish-ref.sh
+      - name: Install package metadata
+        run: npm ci --ignore-scripts
+      - name: Install Podman
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends podman
+      - name: Run release checks
+        run: npm run test:release
+      - name: Run real SSH and shpool lifecycle
+        run: npm run test:e2e
+      - name: Scan public history
+        run: scripts/verify-public-release.sh --history
+      - name: Publish through npm trusted publishing
+        run: npm publish --access public
