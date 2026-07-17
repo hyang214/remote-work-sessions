@@ -1,0 +1,4466 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
+  printf 'rws: missing local dependency: Bash 3.2+ required; found %s\n' "$BASH_VERSION" >&2
+  exit 2
+fi
+
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L "$SOURCE" ]]; do
+  DIR=$(CDPATH='' cd -P -- "$(dirname -- "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+
+USER_CONFIG_DIR="$HOME/.config/rws"
+RWS_VERSION=0.2.0
+RWS_DOCS_URL="https://github.com/hyang214/remote-work-sessions/blob/main/README.md"
+DEFAULT_SHPOOL_VERSION=0.9.8
+RWS_SETUP_STEP_TOTAL=12
+
+CONFIG_DIR=
+DEVICE=default
+DEVICE_OVERRIDE=
+HOST=
+CWD=
+SESSION=
+IDENTITY_FILE=
+SHPOOL_BIN=shpool
+PROMPT_MODE=skip
+PROMPT_LABEL=
+CONFIG_SETUP_VERSION=
+CONFIG_SHPOOL_VERSION=
+HOST_OVERRIDE=
+CWD_OVERRIDE=
+SESSION_OVERRIDE=
+IDENTITY_FILE_OVERRIDE=
+SHPOOL_BIN_OVERRIDE=
+SSH_OPTIONS=()
+SSH_OPTION_OVERRIDES=()
+SETUP_CONTROL_DIR=
+SETUP_CONTROL_PATH=
+SETUP_CONTROL_HOST=
+SETUP_CONTROL_OPENED=0
+CODING_AGENT=
+CODING_CWD=
+CODING_ACCESS=default
+RWS_USAGE_CONTEXT=root
+
+usage() {
+  cat <<'EOF'
+Usage:
+  rws [--config-dir DIR] [--device DEVICE] [--host HOST] [--cwd DIR] [--session SESSION] <command> [args]
+  rws help [topic]
+
+Most used:
+  rws setup                   Add a device, then optionally create a session.
+  rws new SESSION --pick-cwd  Create or attach a named session in a picked cwd.
+  rws attach SESSION          Attach an existing session without changing cwd.
+  rws sessions                List sessions on the selected device.
+  rws --cwd DIR run -- CMD    Run a one-shot command in DIR.
+
+Parameters and options:
+  --config-dir DIR            Use a specific config directory.
+  -d, --device DEVICE         Use devices/<device>.conf.
+  -H, --host HOST             Override the configured SSH host.
+  -C, --cwd DIR               Override the configured remote cwd.
+  -s, --session SESSION       Override the configured default shpool session.
+  -i, --identity-file FILE    Override the SSH identity file.
+  -B, --shpool-bin FILE       Override the remote shpool binary.
+  -o, --ssh-option OPTION     Add an SSH -o option, such as StrictHostKeyChecking=no.
+
+Typical scenarios:
+  rws setup
+  rws new review --pick-cwd --agent codex
+  rws attach review
+  rws s
+  rws --cwd '~/repo' run -- git status --short
+  rws --device lab
+  rws remove lab
+
+More help:
+  rws help scenarios          Scenario-oriented usage guide.
+  rws help commands           Full command and option reference.
+EOF
+}
+
+usage_scenarios() {
+  cat <<'EOF'
+Usage:
+  rws help scenarios
+
+Parameters and options:
+  This topic has no options. Use rws help COMMAND for command-specific details.
+
+First setup:
+  rws setup
+  # Adds a device, installs/verifies SSH key and shpool, then asks whether to
+  # create an initial session. If created, the session is created in the
+  # background and setup prints the attach command; it does not auto-attach.
+
+Start a recoverable coding agent in a picked directory:
+  rws new coding --pick-cwd --agent codex
+  # Enters the selected directory and starts the official Codex CLI inside
+  # shpool. Full access is the default.
+
+  rws new coding-safe --cwd '~/repo' --agent codex --no-full-access
+  # Uses the provider's normal permission behavior instead.
+
+Start another supported coding agent:
+  rws new claude-work --cwd '~/repo' --agent claude
+  rws new kiro-work --cwd '~/repo' --agent kiro
+
+Create an ordinary shell session in a picked directory:
+  rws new review --pick-cwd
+  rws session create build --pick-cwd
+
+Create a session when you know the directory:
+  rws new review --cwd '~/Documents/project'
+  rws session create build --cwd '~/repo'
+
+Reconnect to existing work after SSH disconnects:
+  rws attach review
+  rws force review
+  rws sessions
+
+Recover coding work after reboot or lost shpool state:
+  rws attach coding
+  # rws reads the saved agent/cwd/access metadata, recreates the shpool session,
+  # enters that cwd, and asks the provider CLI to resume its latest conversation.
+
+Run one command in a directory:
+  rws --cwd '~/repo' run -- git status --short
+
+Manage core entities:
+  rws key create|get|list|update|remove
+  rws device create|get|list|update|remove
+  rws session create|get|list|update|delete|attach
+
+Recover from a command-line mistake:
+  rws new coding --agent unknown
+  # The error is followed by this command's usage, parameters, and examples.
+  rws help new
+EOF
+}
+
+usage_commands() {
+  cat <<'EOF'
+Usage:
+  rws help commands
+
+Global:
+  rws [-d DEVICE] [-H HOST] [-C CWD] [-s SESSION] [-i FILE] [-B FILE] [-o OPTION] COMMAND
+  rws --config-dir DIR COMMAND
+  rws -V | --version
+
+Setup and devices:
+  rws setup [-d DEVICE] [-H HOST] [-C CWD] [-s SESSION] [-S|-x] [-k MODE]
+            [-i FILE] [-K|-N] [-b FILE] [-F] [-r MODE] [-B FILE]
+            [-m compact|skip] [-l LABEL] [-o OPTION] [-n] [-y]
+  rws device create DEVICE [setup options]
+  rws device get [DEVICE]
+  rws device update DEVICE [-H HOST] [-C CWD] [-s SESSION] [-i FILE]
+                           [-B FILE] [-m compact|skip] [-l LABEL]
+                           [-o OPTION] [--clear-*] [--default]
+  rws device list
+  rws device remove DEVICE
+  rws remove [DEVICE]
+
+Sessions:
+  rws new SESSION [-C CWD] [-p] [-A codex|claude|kiro] [--no-full-access]
+  rws attach [SESSION]
+  rws force [SESSION]
+  rws background [SESSION]
+  rws session create SESSION [-C CWD] [-p]
+  rws session get SESSION
+  rws session list [-j|--json]
+  rws session update SESSION --detach
+  rws session delete SESSION [SESSION...]
+  rws sessions [-j|--json]
+
+Keys:
+  rws key create [-i FILE] [-f]
+  rws key get [-i FILE]
+  rws key list
+  rws key update [-i FILE] [-f]
+  rws key remove [-i FILE] [-f]
+
+Commands:
+  rws check
+  rws doctor
+  rws status
+  rws shell
+  rws --cwd DIR run -- COMMAND [ARG...]
+  rws detach [SESSION...]
+  rws kill [SESSION...]
+
+Parameters and options:
+  Options are shown beside each command above. Global options must precede COMMAND.
+
+Typical scenarios:
+  rws help new
+  rws help attach
+  rws help scenarios
+EOF
+}
+
+usage_setup() {
+  cat <<'EOF'
+Usage:
+  rws setup [options]
+
+Add a device, configure local and remote prerequisites, and verify it.
+Creating an initial session is optional and uses a one-off cwd.
+
+Parameters and options:
+  -d, --device DEVICE
+  -H, --host HOST
+  -C, --cwd DIR
+  -s, --session SESSION
+  -S, --create-session
+  -x, --no-create-session
+  -k, --key-mode create|existing|skip
+  -i, --identity-file FILE
+  -K, --install-key
+  -N, --no-install-key
+  -b, --bootstrap-identity FILE
+  -F, --force-key
+  -r, --remote-install auto|check|skip
+  --shpool-version VERSION
+  -B, --shpool-bin FILE
+  -m, --prompt-mode compact|skip
+  -l, --prompt-label LABEL
+  -o, --ssh-option OPTION
+  --verify
+  -n, --no-verify
+  -y, --yes
+
+Typical scenarios:
+  rws setup
+  rws setup --host devbox --cwd '~/repo' --no-create-session
+  rws setup --device lab --host user@lab --key-mode existing
+EOF
+}
+
+usage_key() {
+  cat <<'EOF'
+Usage:
+  rws key create [-i|--identity-file FILE] [-f|--force]
+  rws key get [-i|--identity-file FILE]
+  rws key list
+  rws key update [-i|--identity-file FILE] [-f|--force]
+  rws key remove [-i|--identity-file FILE] [-f|--force]
+
+Manage local SSH identity files referenced by rws devices.
+
+Parameters and options:
+  -i, --identity-file FILE    Select the local private-key path.
+  -f, --force                 Confirm key replacement or deletion.
+
+Typical scenarios:
+  rws key list
+  rws key create --identity-file ~/.ssh/rws_ed25519
+  rws key remove --identity-file ~/.ssh/rws_ed25519 --force
+EOF
+}
+
+usage_device() {
+  cat <<'EOF'
+Usage:
+  rws device create DEVICE [setup options]
+  rws device get [DEVICE]
+  rws device update DEVICE [options]
+  rws device list
+  rws device remove DEVICE
+
+Parameters and options:
+  create DEVICE [setup options]  Accepts rws setup options; see rws help setup.
+  get [DEVICE]                   Defaults to the selected device.
+  list                           Accepts no additional arguments.
+  remove DEVICE                  Deletes its config and recovery metadata.
+  -H, --host HOST
+  -C, --cwd DIR
+  -s, --session SESSION
+  -i, --identity-file FILE
+  --clear-identity-file
+  -B, --shpool-bin FILE
+  -m, --prompt-mode compact|skip
+  -l, --prompt-label LABEL
+  --clear-prompt-label
+  -o, --ssh-option OPTION
+  --clear-ssh-options
+  --default
+
+Typical scenarios:
+  rws device list
+  rws device get lab
+  rws device update lab --cwd '~/repo' --default
+EOF
+}
+
+usage_session() {
+  cat <<'EOF'
+Usage:
+  rws session create SESSION [-C|--cwd DIR] [-p|--pick-cwd]
+  rws session get SESSION
+  rws session list [-j|--json]
+  rws session update SESSION --detach
+  rws session delete SESSION [SESSION...]
+  rws session attach [SESSION]
+
+Session commands operate on the selected device's remote shpool sessions.
+Creating a session creates the selected remote cwd when missing.
+If the device has no cwd, pass --cwd or --pick-cwd when creating a session.
+
+Parameters and options:
+  -C, --cwd DIR               Use DIR only for the new session.
+  -p, --pick-cwd              Pick the remote directory interactively.
+  -j, --json                  Print session lists as JSON.
+  --detach                    Detach the named live session.
+
+Typical scenarios:
+  rws session create build --pick-cwd
+  rws session list --json
+  rws session update build --detach
+  rws session delete build
+EOF
+}
+
+usage_new() {
+  cat <<'EOF'
+Usage:
+  rws new SESSION [-C|--cwd DIR] [-p|--pick-cwd] [-A|--agent AGENT] [--no-full-access]
+
+Attach to or create SESSION on the selected device. Use --pick-cwd to browse
+the remote filesystem before creating the session in a one-off cwd. The picker
+supports Tab path completion when the remote host has bash.
+Use --agent codex, --agent claude, or --agent kiro once to make later attaches
+recover the latest conversation for this cwd after remote shpool state is lost.
+An agent starts with full access by default and keeps that mode on recovery.
+Use --no-full-access to retain the provider's normal permission behavior.
+Provider-owned onboarding, workspace-trust, or first-use safety prompts may
+still appear once.
+
+With --agent, the resulting behavior is:
+  1. Resolve or interactively pick the remote cwd.
+  2. Create/attach the named shpool session and enter that cwd.
+  3. Start the selected agent automatically inside shpool.
+  4. On later recovery, recreate shpool if needed and resume the provider's
+     latest conversation for that cwd.
+
+Default full-access launch and recovery mapping:
+  codex   codex --dangerously-bypass-approvals-and-sandbox; recovery uses
+          codex resume --last with the same official full-access option
+  claude  claude --dangerously-skip-permissions; recovery adds --continue
+  kiro    kiro-cli chat --trust-all-tools; recovery adds --resume
+With --no-full-access, rws omits those full-access flags.
+
+Parameters and options:
+  -C, --cwd DIR               Use DIR for this session.
+  -p, --pick-cwd              Pick the remote directory interactively.
+  -A, --agent AGENT           Start codex, claude, or kiro automatically.
+  --no-full-access            Keep normal provider permission behavior.
+  --full-access               Compatibility flag; full access is already default.
+
+Typical scenarios:
+  rws new coding --pick-cwd --agent codex
+  rws new coding --cwd '~/repo' --agent codex --no-full-access
+  rws new claude-work --cwd '~/repo' --agent claude
+  rws attach coding
+EOF
+}
+
+usage_run() {
+  cat <<'EOF'
+Usage:
+  rws run -- COMMAND [ARG...]
+
+Run COMMAND in the selected device's remote cwd. stdout, stderr, and the remote
+command exit code are preserved.
+
+Parameters and options:
+  --                            End rws options before COMMAND.
+  -C, --cwd DIR                 Global option selecting the remote directory.
+
+Typical scenarios:
+  rws --cwd '~/repo' run -- git status --short
+  rws --device lab --cwd '~/repo' run -- npm test
+EOF
+}
+
+usage_attach() {
+  cat <<'EOF'
+Usage:
+  rws attach [SESSION]
+
+Attach an existing shpool session. If saved coding-agent metadata exists and
+the remote session was lost, recreate it in the saved cwd and resume the agent.
+
+Parameters and options:
+  SESSION                     Optional session; defaults to the device setting.
+
+Typical scenarios:
+  rws attach coding
+  rws --device lab attach review
+EOF
+}
+
+usage_force() {
+  cat <<'EOF'
+Usage:
+  rws force [SESSION]
+
+Force-attach a session, disconnecting another attached client when necessary.
+
+Parameters and options:
+  SESSION                     Optional session; defaults to the device setting.
+
+Typical scenarios:
+  rws force coding
+  rws --device lab force review
+EOF
+}
+
+usage_background() {
+  cat <<'EOF'
+Usage:
+  rws background [SESSION]
+
+Create or attach a plain session without occupying the current terminal.
+Agent sessions must be started or recovered interactively with rws attach.
+
+Parameters and options:
+  SESSION                     Optional session; defaults to the device setting.
+
+Typical scenarios:
+  rws --cwd '~/repo' background build
+  rws sessions
+EOF
+}
+
+usage_check() {
+  cat <<'EOF'
+Usage:
+  rws check
+
+Parameters and options:
+  This command accepts no arguments.
+
+Typical scenarios:
+  rws check
+  rws --device lab check
+EOF
+}
+
+usage_doctor() {
+  cat <<'EOF'
+Usage:
+  rws doctor
+
+Parameters and options:
+  This command accepts no arguments.
+
+Typical scenarios:
+  rws doctor
+  rws --device lab doctor
+EOF
+}
+
+usage_status() {
+  cat <<'EOF'
+Usage:
+  rws status
+
+Parameters and options:
+  This command accepts no arguments.
+
+Typical scenarios:
+  rws status
+  rws --device lab status
+EOF
+}
+
+usage_shell() {
+  cat <<'EOF'
+Usage:
+  rws shell
+
+Parameters and options:
+  -C, --cwd DIR               Global option selecting the remote directory.
+
+Typical scenarios:
+  rws --cwd '~/repo' shell
+  rws --device lab --cwd '~/repo' shell
+EOF
+}
+
+usage_sessions() {
+  cat <<'EOF'
+Usage:
+  rws sessions [-j|--json]
+
+Parameters and options:
+  -j, --json                  Print the remote session list as JSON.
+
+Typical scenarios:
+  rws sessions
+  rws --device lab sessions --json
+EOF
+}
+
+usage_detach() {
+  cat <<'EOF'
+Usage:
+  rws detach [SESSION...]
+
+Parameters and options:
+  SESSION                     Zero or more sessions; defaults to device setting.
+
+Typical scenarios:
+  rws detach
+  rws detach coding review
+EOF
+}
+
+usage_kill() {
+  cat <<'EOF'
+Usage:
+  rws kill [SESSION...]
+
+Delete remote sessions and any matching saved coding-agent metadata.
+
+Parameters and options:
+  SESSION                     Zero or more sessions; defaults to device setting.
+
+Typical scenarios:
+  rws kill coding
+  rws kill coding review
+EOF
+}
+
+usage_remove() {
+  cat <<'EOF'
+Usage:
+  rws remove [DEVICE]
+
+Parameters and options:
+  DEVICE                      Optional device; defaults to the selected device.
+
+Typical scenarios:
+  rws remove lab
+  rws --device lab remove
+EOF
+}
+
+usage_init() {
+  cat <<'EOF'
+Usage:
+  rws init --host HOST [options]
+
+Low-level non-interactive configuration command. Prefer rws setup for normal use.
+
+Parameters and options:
+  -d, --device DEVICE         Device name.
+  -H, --host HOST             Required SSH target.
+  -C, --cwd DIR               Optional default remote directory.
+  -s, --session SESSION       Optional default session.
+  -k, --key-mode MODE         create, existing, or skip.
+  -i, --identity-file FILE    Local SSH private-key path.
+  -B, --shpool-bin FILE       Remote shpool executable.
+  --setup-version VERSION     Record the setup version for controlled scripts.
+  --shpool-version VERSION    Record the remote shpool version.
+  -m, --prompt-mode MODE      compact or skip.
+  -l, --prompt-label LABEL    Compact prompt label.
+  -K, --install-key           Install the selected public key.
+  -b, --bootstrap-identity FILE
+  -F, --force-key
+  -o, --ssh-option OPTION
+
+Typical scenarios:
+  rws init --host devbox --cwd '~/repo' --key-mode skip
+  rws init --device lab --host user@lab --key-mode existing
+EOF
+}
+
+usage_for_context() {
+  case "${1:-root}" in
+    root|help) usage ;;
+    setup) usage_setup ;;
+    init) usage_init ;;
+    key) usage_key ;;
+    device) usage_device ;;
+    session) usage_session ;;
+    new) usage_new ;;
+    attach) usage_attach ;;
+    force) usage_force ;;
+    background) usage_background ;;
+    check) usage_check ;;
+    doctor) usage_doctor ;;
+    status) usage_status ;;
+    shell) usage_shell ;;
+    sessions) usage_sessions ;;
+    run) usage_run ;;
+    detach) usage_detach ;;
+    kill) usage_kill ;;
+    remove) usage_remove ;;
+    *) usage ;;
+  esac
+}
+
+command_usage_context() {
+  case "$1" in
+    n|new) printf 'new\n' ;;
+    a|attach) printf 'attach\n' ;;
+    f|force) printf 'force\n' ;;
+    bg|background) printf 'background\n' ;;
+    c|check) printf 'check\n' ;;
+    s|status) printf 'status\n' ;;
+    sh|shell) printf 'shell\n' ;;
+    sessions|ls|list) printf 'sessions\n' ;;
+    devices) printf 'device\n' ;;
+    d|detach) printf 'detach\n' ;;
+    k|kill) printf 'kill\n' ;;
+    remove|rm) printf 'remove\n' ;;
+    setup|init|doctor|key|device|session|run|help) printf '%s\n' "$1" ;;
+    *) printf 'root\n' ;;
+  esac
+}
+
+cmd_help() {
+  local topic=${1:-}
+  [[ $# -le 1 ]] || die "help accepts at most one TOPIC"
+  case "$topic" in
+    ''|help)
+      usage
+      ;;
+    setup)
+      usage_setup
+      ;;
+    key)
+      usage_key
+      ;;
+    device)
+      usage_device
+      ;;
+    devices)
+      usage_device
+      ;;
+    session)
+      usage_session
+      ;;
+    sessions|ls|list)
+      usage_sessions
+      ;;
+    new|n)
+      usage_new
+      ;;
+    attach|a)
+      usage_attach
+      ;;
+    force|f)
+      usage_force
+      ;;
+    background|bg)
+      usage_background
+      ;;
+    check|c)
+      usage_check
+      ;;
+    doctor)
+      usage_doctor
+      ;;
+    status|s)
+      usage_status
+      ;;
+    shell|sh)
+      usage_shell
+      ;;
+    detach|d)
+      usage_detach
+      ;;
+    kill|k)
+      usage_kill
+      ;;
+    remove|rm)
+      usage_remove
+      ;;
+    init)
+      usage_init
+      ;;
+    run)
+      usage_run
+      ;;
+    scenarios|scenario|use|usage)
+      usage_scenarios
+      ;;
+    commands|command|reference)
+      usage_commands
+      ;;
+    *)
+      die "unknown help topic: $topic"
+      ;;
+  esac
+}
+
+die() {
+  printf 'rws: %s\n' "$*" >&2
+  printf '\n' >&2
+  usage_for_context "$RWS_USAGE_CONTEXT" >&2
+  exit 2
+}
+
+sq() {
+  local value=${1-}
+  printf "'"
+  printf "%s" "$value" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+join_quoted() {
+  local out=()
+  local arg
+  for arg in "$@"; do
+    out+=("$(sq "$arg")")
+  done
+  printf "%s" "${out[*]}"
+}
+
+escape_dq() {
+  printf "%s" "$1" | sed 's/["\\`$]/\\&/g'
+}
+
+remote_path() {
+  local path=$1
+  case "$path" in
+    "~")
+      printf '"$HOME"'
+      ;;
+    "~/"*)
+      printf '"$HOME/%s"' "$(escape_dq "${path#\~/}")"
+      ;;
+    *)
+      sq "$path"
+      ;;
+  esac
+}
+
+remote_exec_path() {
+  local path=$1
+  case "$path" in
+    "~"|"~/"*|/*|.*/*)
+      remote_path "$path"
+      ;;
+    *)
+      sq "$path"
+      ;;
+  esac
+}
+
+shpool_term_value() {
+  local term=${TERM:-}
+  # Keep the remote shell assignment simple; fall back on empty, dumb, or unsafe TERM values.
+  case "$term" in
+    ''|dumb|*[!A-Za-z0-9._+:-]*)
+      term=xterm-256color
+      ;;
+  esac
+  printf '%s' "$term"
+}
+
+local_path() {
+  local path=$1
+  case "$path" in
+    "~")
+      printf "%s" "$HOME"
+      ;;
+    "~/"*)
+      printf "%s/%s" "$HOME" "${path#\~/}"
+      ;;
+    *)
+      printf "%s" "$path"
+      ;;
+  esac
+}
+
+coding_session_file() {
+  local session=$1
+  printf '%s/sessions/%s/%s.conf' "$CONFIG_DIR" "$DEVICE" "$session"
+}
+
+coding_session_exists() {
+  local session=$1
+  [[ -f "$(coding_session_file "$session")" ]]
+}
+
+load_coding_session() {
+  local session=$1
+  local file
+  file=$(coding_session_file "$session")
+  CODING_AGENT=
+  CODING_CWD=
+  CODING_ACCESS=default
+  [[ -f "$file" ]] || return 1
+
+  local version agent cwd access extra
+  version=
+  agent=
+  cwd=
+  access=
+  extra=
+  {
+    IFS= read -r version || true
+    IFS= read -r agent || true
+    IFS= read -r cwd || true
+    IFS= read -r access || true
+    IFS= read -r extra || true
+  } < "$file"
+
+  case "$version" in
+    rws-coding-session-v1)
+      [[ -n "$agent" && -n "$cwd" && -z "$access" && -z "$extra" ]] \
+        || die "invalid coding session metadata: $file"
+      access=default
+      ;;
+    rws-coding-session-v2)
+      [[ -n "$agent" && -n "$cwd" && -n "$access" && -z "$extra" ]] \
+        || die "invalid coding session metadata: $file"
+      ;;
+    *)
+      die "invalid coding session metadata: $file"
+      ;;
+  esac
+  validate_coding_agent "$agent"
+  validate_cwd_value "$cwd"
+  validate_coding_access "$access"
+  CODING_AGENT=$agent
+  CODING_CWD=$cwd
+  CODING_ACCESS=$access
+}
+
+write_coding_session() {
+  local session=$1
+  local agent=$2
+  local cwd=$3
+  local access=${4:-default}
+  validate_session_name "$session"
+  validate_coding_agent "$agent"
+  validate_cwd_value "$cwd"
+  validate_coding_access "$access"
+
+  local file dir tmp old_umask
+  file=$(coding_session_file "$session")
+  dir=$(dirname "$file")
+  tmp="$file.tmp.$$"
+  old_umask=$(umask)
+  umask 077
+  mkdir -p "$dir"
+  {
+    printf 'rws-coding-session-v2\n'
+    printf '%s\n' "$agent"
+    printf '%s\n' "$cwd"
+    printf '%s\n' "$access"
+  } > "$tmp"
+  mv "$tmp" "$file"
+  umask "$old_umask"
+}
+
+remove_coding_session() {
+  local session=$1
+  local file dir device_dir
+  file=$(coding_session_file "$session")
+  dir=$(dirname "$file")
+  device_dir=$(dirname "$dir")
+  rm -f "$file"
+  rmdir "$dir" 2>/dev/null || true
+  rmdir "$device_dir" 2>/dev/null || true
+}
+
+coding_agent_binary() {
+  local agent=$1
+  case "$agent" in
+    codex)
+      printf 'codex'
+      ;;
+    claude)
+      printf 'claude'
+      ;;
+    kiro)
+      printf 'kiro-cli'
+      ;;
+    *)
+      die "invalid coding agent: $agent"
+      ;;
+  esac
+}
+
+coding_agent_command() {
+  local agent=$1
+  local mode=$2
+  local access=${3:-default}
+  validate_coding_access "$access"
+  case "$agent:$access:$mode" in
+    codex:default:initial)
+      printf 'codex'
+      ;;
+    codex:default:resume)
+      printf 'codex resume --last'
+      ;;
+    codex:full:initial)
+      printf 'codex --dangerously-bypass-approvals-and-sandbox'
+      ;;
+    codex:full:resume)
+      printf 'codex resume --last --dangerously-bypass-approvals-and-sandbox'
+      ;;
+    claude:default:initial)
+      printf 'claude'
+      ;;
+    claude:default:resume)
+      printf 'claude --continue'
+      ;;
+    claude:full:initial)
+      printf 'claude --dangerously-skip-permissions'
+      ;;
+    claude:full:resume)
+      printf 'claude --dangerously-skip-permissions --continue'
+      ;;
+    kiro:default:initial)
+      printf 'kiro-cli chat'
+      ;;
+    kiro:default:resume)
+      printf 'kiro-cli chat --resume'
+      ;;
+    kiro:full:initial)
+      printf 'kiro-cli chat --trust-all-tools'
+      ;;
+    kiro:full:resume)
+      printf 'kiro-cli chat --trust-all-tools --resume'
+      ;;
+    *)
+      die "invalid coding agent launch mode: $agent/$access/$mode"
+      ;;
+  esac
+}
+
+coding_agent_shell_command() {
+  local agent=$1
+  local mode=$2
+  local access=${3:-default}
+  local strict_recovery=0
+  if [[ "$mode" == "live-resume" ]]; then
+    mode=resume
+    strict_recovery=1
+  fi
+  local agent_command label agent_invocation inner prefix=
+  agent_command=$(coding_agent_command "$agent" "$mode" "$access")
+  label=${PROMPT_LABEL:-$DEVICE}
+  agent_invocation="exec $agent_command"
+  if [[ "$strict_recovery" == "1" ]]; then
+    local binary dependency_check
+    binary=$(coding_agent_binary "$agent")
+    dependency_check="command -v $binary >/dev/null 2>&1"
+    prefix="rws_cwd=$(remote_path "$CWD")
+if [ ! -e \"\$rws_cwd\" ]; then
+  echo \"rws: remote cwd missing: \$rws_cwd\" >&2
+  exit 2
+fi
+if ! cd \"\$rws_cwd\" 2>/dev/null; then
+  echo \"rws: remote cwd not accessible: \$rws_cwd\" >&2
+  exit 2
+fi
+if ! \"\${SHELL:-/bin/sh}\" -ic $(sq "$dependency_check") </dev/null >/dev/null 2>&1; then
+  echo $(sq "rws: remote dependency missing: coding agent $agent ($binary). Install it before restoring this session.") >&2
+  exit 2
+fi
+"
+  fi
+  inner="$prefix\"\${SHELL:-/bin/sh}\" -ic $(sq "$agent_invocation")
+rws_agent_status=\$?
+if [ \"\$rws_agent_status\" -ne 0 ]; then
+  printf 'rws: coding agent $agent exited with status %s; staying in shell\\n' \"\$rws_agent_status\" >&2
+fi
+exec \"\${SHELL:-/bin/sh}\" -i"
+  printf 'env RWS_DEVICE_LABEL=%s sh -lc %s' \
+    "$(sq "$label")" "$(sq "$inner")"
+}
+
+coding_agent_preflight() {
+  local agent=$1
+  local access=${2:-default}
+  local binary check requirement
+  validate_coding_access "$access"
+  binary=$(coding_agent_binary "$agent")
+  requirement=$binary
+  check="command -v $binary >/dev/null 2>&1"
+  ssh_plain_diagnosed "rws_shell=\${SHELL:-/bin/sh}
+if ! \"\$rws_shell\" -ic $(sq "$check") </dev/null >/dev/null 2>&1; then
+  echo $(sq "rws: remote dependency missing: coding agent $agent ($requirement). Install it before restoring this session.") >&2
+  exit 2
+fi"
+}
+
+trim() {
+  local value=$1
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf "%s" "$value"
+}
+
+unquote() {
+  local value=$1
+  case "$value" in
+    \"*\")
+      value=${value#\"}
+      value=${value%\"}
+      ;;
+    \'*\')
+      value=${value#\'}
+      value=${value%\'}
+      ;;
+  esac
+  printf "%s" "$value"
+}
+
+load_config() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%%#*}
+    line=$(trim "$line")
+    [[ -z "$line" ]] && continue
+    [[ "$line" == *=* ]] || die "invalid config line in $file: $line"
+
+    key=$(trim "${line%%=*}")
+    value=$(trim "${line#*=}")
+    value=$(unquote "$value")
+
+    case "$key" in
+      device)
+        DEVICE=$value
+        ;;
+      host)
+        HOST=$value
+        ;;
+      cwd)
+        CWD=$value
+        ;;
+      default_session)
+        SESSION=$value
+        ;;
+      identity_file)
+        IDENTITY_FILE=$value
+        ;;
+      shpool_bin)
+        SHPOOL_BIN=$value
+        ;;
+      prompt_mode)
+        PROMPT_MODE=$value
+        ;;
+      prompt_label)
+        PROMPT_LABEL=$value
+        ;;
+      setup_version)
+        CONFIG_SETUP_VERSION=$value
+        ;;
+      shpool_version)
+        CONFIG_SHPOOL_VERSION=$value
+        ;;
+      ssh_option)
+        SSH_OPTIONS+=("$value")
+        ;;
+      *)
+        die "unknown config key in $file: $key"
+        ;;
+    esac
+  done < "$file"
+}
+
+has_device_files() {
+  local dir=$1
+  local device_file
+  for device_file in "$dir"/devices/*.conf; do
+    [[ -e "$device_file" ]] && return 0
+  done
+  return 1
+}
+
+select_config_dir() {
+  if [[ -n "$CONFIG_DIR" ]]; then
+    return
+  fi
+  if [[ -f "$USER_CONFIG_DIR/default.conf" ]] || has_device_files "$USER_CONFIG_DIR"; then
+    CONFIG_DIR=$USER_CONFIG_DIR
+  else
+    die "not initialized. Run: rws setup"
+  fi
+}
+
+write_config_dir() {
+  if [[ -n "$CONFIG_DIR" ]]; then
+    printf '%s' "$CONFIG_DIR"
+  else
+    printf '%s' "$USER_CONFIG_DIR"
+  fi
+}
+
+load_selected_device() {
+  select_config_dir
+  load_config "$CONFIG_DIR/default.conf"
+  if [[ -n "$DEVICE_OVERRIDE" ]]; then
+    DEVICE=$DEVICE_OVERRIDE
+  fi
+  validate_device_name "$DEVICE"
+
+  local device_config="$CONFIG_DIR/devices/$DEVICE.conf"
+  [[ -f "$device_config" ]] || die "device not found: $DEVICE"
+  load_config "$device_config"
+
+  if [[ -n "$HOST_OVERRIDE" ]]; then
+    HOST=$HOST_OVERRIDE
+  fi
+  if [[ -n "$CWD_OVERRIDE" ]]; then
+    CWD=$CWD_OVERRIDE
+  fi
+  if [[ -n "$SESSION_OVERRIDE" ]]; then
+    SESSION=$SESSION_OVERRIDE
+  fi
+  if [[ -n "$IDENTITY_FILE_OVERRIDE" ]]; then
+    IDENTITY_FILE=$IDENTITY_FILE_OVERRIDE
+  fi
+  if [[ -n "$SHPOOL_BIN_OVERRIDE" ]]; then
+    SHPOOL_BIN=$SHPOOL_BIN_OVERRIDE
+  fi
+  if [[ ${#SSH_OPTION_OVERRIDES[@]} -gt 0 ]]; then
+    SSH_OPTIONS+=("${SSH_OPTION_OVERRIDES[@]}")
+  fi
+
+  [[ -n "$HOST" ]] || die "missing host in device: $DEVICE"
+  if [[ -n "$CWD" ]]; then
+    validate_cwd_value "$CWD"
+  fi
+  validate_prompt_mode "$PROMPT_MODE"
+  if [[ "$PROMPT_MODE" == "compact" && -z "$PROMPT_LABEL" ]]; then
+    PROMPT_LABEL=$DEVICE
+  fi
+  if [[ -n "$PROMPT_LABEL" ]]; then
+    validate_prompt_label "$PROMPT_LABEL"
+  fi
+  if [[ -n "$SESSION" ]]; then
+    validate_session_name "$SESSION"
+  fi
+}
+
+require_cwd() {
+  local command_name=$1
+  [[ -n "$CWD" ]] || die "$command_name requires a cwd. Pass --cwd DIR, use --pick-cwd, or configure a device cwd with rws device update $DEVICE --cwd DIR"
+  validate_cwd_value "$CWD"
+}
+
+require_session() {
+  local command_name=$1
+  [[ -n "$SESSION" ]] || die "$command_name requires a session. Pass SESSION, use --session SESSION, or create one with rws new SESSION --pick-cwd"
+  validate_session_name "$SESSION"
+}
+
+display_optional() {
+  local value=${1-}
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+  else
+    printf '(not set)'
+  fi
+}
+
+ssh_base_args() {
+  local args=()
+  local option
+  if [[ -n "$IDENTITY_FILE" ]]; then
+    args+=(-i "$(local_path "$IDENTITY_FILE")")
+  fi
+  if [[ ${#SSH_OPTIONS[@]} -gt 0 ]]; then
+    for option in "${SSH_OPTIONS[@]}"; do
+      args+=(-o "$option")
+    done
+  fi
+  if [[ ${#args[@]} -gt 0 ]]; then
+    printf '%s\0' "${args[@]}"
+  fi
+}
+
+ssh_plain() {
+  check_local_ssh
+  local args=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(ssh_base_args)
+  if [[ ${#args[@]} -gt 0 ]]; then
+    ssh -o BatchMode=yes "${args[@]}" "$HOST" "$@"
+  else
+    ssh -o BatchMode=yes "$HOST" "$@"
+  fi
+}
+
+ssh_tty() {
+  check_local_ssh
+  local args=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(ssh_base_args)
+  if [[ -t 0 && ${#args[@]} -gt 0 ]]; then
+    ssh -tt "${args[@]}" "$HOST" "$@"
+  elif [[ -t 0 ]]; then
+    ssh -tt "$HOST" "$@"
+  elif [[ ${#args[@]} -gt 0 ]]; then
+    ssh "${args[@]}" "$HOST" "$@"
+  else
+    ssh "$HOST" "$@"
+  fi
+}
+
+ssh_interactive_plain() {
+  check_local_ssh
+  local args=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(ssh_base_args)
+  if [[ ${#args[@]} -gt 0 ]]; then
+    ssh "${args[@]}" "$HOST" "$@"
+  else
+    ssh "$HOST" "$@"
+  fi
+}
+
+ssh_interactive_capture() {
+  local output_file=$1
+  shift
+  check_local_ssh
+  local args=()
+  local arg status
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(ssh_base_args)
+
+  set +e
+  if [[ -t 0 && ${#args[@]} -gt 0 ]]; then
+    ssh -tt "${args[@]}" "$HOST" "$@" | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  elif [[ -t 0 ]]; then
+    ssh -tt "$HOST" "$@" | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  elif [[ ${#args[@]} -gt 0 ]]; then
+    ssh "${args[@]}" "$HOST" "$@" 2>&1 | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  else
+    ssh "$HOST" "$@" 2>&1 | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  fi
+  set -e
+  return "$status"
+}
+
+classify_ssh_failure() {
+  local stderr_file=$1
+  if grep -Eqi 'Could not resolve hostname|Name or service not known|nodename nor servname|Temporary failure in name resolution' "$stderr_file"; then
+    printf 'rws: ssh_error=dns_failed. Check the configured host: %s\n' "$HOST" >&2
+  elif grep -Eqi 'Connection refused' "$stderr_file"; then
+    printf 'rws: ssh_error=connection_refused. Check that SSH is running and reachable on the remote host.\n' >&2
+  elif grep -Eqi 'Connection timed out|Operation timed out|connect to host .* port .* timed out' "$stderr_file"; then
+    printf 'rws: ssh_error=connection_timeout. Check network access, VPN, firewall, or SSH routing.\n' >&2
+  elif grep -Eqi 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed' "$stderr_file"; then
+    printf 'rws: ssh_error=host_key_changed. Verify the host identity before updating known_hosts.\n' >&2
+  elif grep -Eqi 'Permission denied|Authentication failed|Too many authentication failures' "$stderr_file"; then
+    printf 'rws: ssh_error=authentication_failed. Check username, password, SSH key, or ssh-agent.\n' >&2
+  elif grep -Eqi 'Connection reset|kex_exchange_identification|Connection closed by remote host' "$stderr_file"; then
+    printf 'rws: ssh_error=connection_reset. Retry after the remote SSH service is fully ready.\n' >&2
+  else
+    printf 'rws: ssh_error=unknown. Run with the same SSH host and options to inspect the raw SSH failure.\n' >&2
+  fi
+}
+
+ssh_plain_diagnosed() {
+  check_local_ssh
+  local stderr_file rc
+  stderr_file=$(mktemp)
+  set +e
+  ssh_plain "$@" 2>"$stderr_file"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    rm -f "$stderr_file"
+    return 0
+  fi
+  if [[ -s "$stderr_file" ]]; then
+    if ! grep -Eq '^rws: (remote cwd|remote dependency|shpool|expected shpool)' "$stderr_file"; then
+      classify_ssh_failure "$stderr_file"
+    fi
+    cat "$stderr_file" >&2
+  else
+    classify_ssh_failure "$stderr_file"
+  fi
+  rm -f "$stderr_file"
+  return "$rc"
+}
+
+remote_cwd_preflight_command() {
+  [[ -n "$CWD" ]] || return 0
+  cat <<EOF
+rws_cwd=$(remote_path "$CWD")
+if [ ! -e "\$rws_cwd" ]; then
+  echo "rws: remote cwd missing: \$rws_cwd" >&2
+  exit 2
+fi
+if ! cd "\$rws_cwd" 2>/dev/null; then
+  echo "rws: remote cwd not accessible: \$rws_cwd" >&2
+  exit 2
+fi
+EOF
+}
+
+remote_cwd_ensure_command() {
+  require_cwd "session creation"
+  cat <<EOF
+rws_cwd=$(remote_path "$CWD")
+if ! mkdir -p "\$rws_cwd"; then
+  echo "rws: remote cwd cannot be created: \$rws_cwd" >&2
+  exit 2
+fi
+if ! cd "\$rws_cwd" 2>/dev/null; then
+  echo "rws: remote cwd not accessible: \$rws_cwd" >&2
+  exit 2
+fi
+EOF
+}
+
+remote_shpool_preflight_command() {
+  cat <<EOF
+rws_shpool_bin=$(remote_exec_path "$SHPOOL_BIN")
+case "\$rws_shpool_bin" in
+  */*)
+    [ -x "\$rws_shpool_bin" ] || {
+      echo "rws: remote dependency missing: shpool (\$rws_shpool_bin). Run: rws setup" >&2
+      exit 2
+    }
+    ;;
+  *)
+    command -v "\$rws_shpool_bin" >/dev/null 2>&1 || {
+      echo "rws: remote dependency missing: shpool (\$rws_shpool_bin). Run: rws setup" >&2
+      exit 2
+    }
+    ;;
+esac
+EOF
+}
+
+remote_check_command() {
+  local expected_shpool=${CONFIG_SHPOOL_VERSION:-}
+  local cwd_command cwd_report
+  if [[ -n "$CWD" ]]; then
+    cwd_command=$(remote_cwd_preflight_command)
+    cwd_report='printf "cwd="; pwd'
+  else
+    cwd_command=
+    cwd_report='printf "cwd=(not set)\n"'
+  fi
+  cat <<EOF
+set -eu
+$cwd_command
+$(remote_shpool_preflight_command)
+rws_expected_shpool=$(sq "$expected_shpool")
+printf "host="
+hostname
+printf "user="
+whoami
+$cwd_report
+if ! rws_shpool_version=\$("\$rws_shpool_bin" version 2>&1); then
+  echo "rws: shpool command failed: \$rws_shpool_version" >&2
+  exit 2
+fi
+printf "shpool=%s\n" "\$rws_shpool_version"
+if [ -n "\$rws_expected_shpool" ] && [ "\$rws_shpool_version" != "shpool \$rws_expected_shpool" ]; then
+  echo "rws: expected shpool \$rws_expected_shpool but found: \$rws_shpool_version" >&2
+  exit 2
+fi
+if ! rws_sessions=\$("\$rws_shpool_bin" list --json 2>&1); then
+  echo "rws: shpool daemon check failed: \$rws_sessions" >&2
+  exit 2
+fi
+printf "sessions=%s\n" "\$rws_sessions"
+EOF
+}
+
+remote_cwd_picker_command() {
+  local start=$1
+  local picker_body start_expr
+  start_expr=$(remote_path "$start")
+  read -r -d '' picker_body <<'EOF_PICKER' || true
+set -eu
+rws_cwd=__RWS_START_CWD__
+rws_resolve_target() {
+  case "$1" in
+    '~')
+      printf '%s\n' "$HOME"
+      ;;
+    '~'/*)
+      printf '%s/%s\n' "$HOME" "${1#??}"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+rws_read_line() {
+  if [ -n "\${BASH_VERSION:-}" ] && [ -t 0 ]; then
+    bind 'set completion-ignore-case on' >/dev/null 2>&1 || true
+    IFS= read -e -r -p 'rws cwd> ' rws_line || exit 130
+  else
+    printf 'rws cwd> ' >&2
+    IFS= read -r rws_line || exit 130
+  fi
+}
+while :; do
+  if ! cd "$rws_cwd" 2>/dev/null; then
+    printf 'rws: remote cwd not found: %s; starting at home\n' "$rws_cwd" >&2
+    rws_cwd=$HOME
+    cd "$rws_cwd" 2>/dev/null || exit 2
+  fi
+  rws_pwd=$(pwd)
+  printf '\nRemote cwd: %s\n' "$rws_pwd" >&2
+  printf 'Commands: Enter=use, cd DIR, mkdir [-p] DIR, ls [DIR], pwd, q=cancel, Tab=complete\n' >&2
+  rws_read_line
+  case "$rws_line" in
+    ''|'.')
+      printf '__RWS_SELECTED_CWD__=%s\n' "$rws_pwd"
+      exit 0
+      ;;
+    q|quit|exit)
+      exit 130
+      ;;
+    pwd)
+      printf '%s\n' "$rws_pwd" >&2
+      ;;
+    ls)
+      ls -la >&2
+      ;;
+    ls\ *)
+      rws_target=${rws_line#ls }
+      rws_target=$(rws_resolve_target "$rws_target")
+      ls -la "$rws_target" >&2 || true
+      ;;
+    mkdir)
+      printf 'rws: mkdir requires DIR\n' >&2
+      ;;
+    mkdir\ *)
+      rws_mkdir_args=${rws_line#mkdir }
+      case "$rws_mkdir_args" in
+        -p\ *)
+          rws_target=${rws_mkdir_args#-p }
+          rws_target=$(rws_resolve_target "$rws_target")
+          if mkdir -p "$rws_target"; then
+            rws_created=$(cd "$rws_target" 2>/dev/null && pwd || printf '%s\n' "$rws_target")
+            printf 'created directory: %s\n' "$rws_created" >&2
+          fi
+          ;;
+        *)
+          rws_target=$(rws_resolve_target "$rws_mkdir_args")
+          if mkdir "$rws_target"; then
+            rws_created=$(cd "$rws_target" 2>/dev/null && pwd || printf '%s\n' "$rws_target")
+            printf 'created directory: %s\n' "$rws_created" >&2
+          fi
+          ;;
+      esac
+      ;;
+    cd)
+      rws_cwd=$HOME
+      ;;
+    cd\ *)
+      rws_target=${rws_line#cd }
+      rws_target=$(rws_resolve_target "$rws_target")
+      if cd "$rws_target" 2>/dev/null; then
+        rws_cwd=$(pwd)
+      else
+        printf 'rws: directory not found: %s\n' "$rws_target" >&2
+      fi
+      ;;
+    /*|'~'|'~'/*)
+      case "$rws_line" in
+        '~')
+          rws_target=$HOME
+          ;;
+        '~'/*)
+          rws_target=$HOME/${rws_line#??}
+          ;;
+        *)
+          rws_target=$rws_line
+          ;;
+      esac
+      if cd "$rws_target" 2>/dev/null; then
+        rws_cwd=$(pwd)
+      else
+        printf 'rws: directory not found: %s\n' "$rws_line" >&2
+      fi
+      ;;
+    *)
+      if cd "$rws_line" 2>/dev/null; then
+        rws_cwd=$(pwd)
+      else
+        printf 'rws: unknown command or directory: %s\n' "$rws_line" >&2
+      fi
+      ;;
+  esac
+done
+EOF_PICKER
+  picker_body=${picker_body/__RWS_START_CWD__/$start_expr}
+  cat <<EOF
+if command -v bash >/dev/null 2>&1; then
+  exec bash -lc $(sq "$picker_body")
+fi
+$picker_body
+EOF
+}
+
+parse_selected_cwd() {
+  local output_file=$1
+  tr -d '\r' < "$output_file" | sed -n 's/.*__RWS_SELECTED_CWD__=//p' | tail -n 1
+}
+
+pick_remote_cwd() {
+  local selected remote_cmd output_file status
+  remote_cmd=$(remote_cwd_picker_command "${CWD:-~}")
+  output_file=$(mktemp "${TMPDIR:-/tmp}/rws-cwd-picker.XXXXXX")
+  if ssh_interactive_capture "$output_file" "$remote_cmd"; then
+    status=0
+  else
+    status=$?
+  fi
+  selected=$(parse_selected_cwd "$output_file")
+  rm -f "$output_file"
+  if [[ "$status" != "0" ]]; then
+    die "remote cwd selection failed or was canceled"
+  fi
+  [[ -n "$selected" ]] || die "remote cwd selection returned an empty path"
+  validate_cwd_value "$selected"
+  CWD=$selected
+  printf 'selected remote cwd: %s\n' "$CWD" >&2
+}
+
+setup_pick_remote_cwd() {
+  local start=$1
+  local selected remote_cmd output_file status
+  printf 'Select remote working directory. Use Enter to confirm, cd DIR to move, or q to cancel.\n' >&2
+  remote_cmd=$(remote_cwd_picker_command "$start")
+  output_file=$(mktemp "${TMPDIR:-/tmp}/rws-cwd-picker.XXXXXX")
+  if setup_ssh_run_capture "$output_file" "$remote_cmd"; then
+    status=0
+  else
+    status=$?
+  fi
+  selected=$(parse_selected_cwd "$output_file")
+  rm -f "$output_file"
+  if [[ "$status" != "0" ]]; then
+    if [[ "$status" == "130" ]]; then
+      setup_cancel
+    fi
+    die "remote cwd selection failed or was canceled"
+  fi
+  [[ -n "$selected" ]] || die "remote cwd selection returned an empty path"
+  validate_cwd_value "$selected"
+  printf 'selected remote cwd: %s\n' "$selected" >&2
+  printf '%s' "$selected"
+}
+
+shpool_attach_command() {
+  local session=$1
+  local force=$2
+  local background=$3
+  local coding_agent=${4:-}
+  local coding_mode=${5:-initial}
+  local coding_access=${6:-default}
+
+  local remote_cmd=
+  if [[ -n "$CWD" ]]; then
+    if [[ -n "$coding_agent" && "$coding_mode" == "live-resume" ]]; then
+      # Creation options are ignored by shpool for an existing session. Resolve
+      # the saved path without touching it so a healthy session can be attached
+      # even when its original cwd is temporarily unavailable. If the session
+      # vanished after the preceding list, shpool applies -d while recreating it.
+      remote_cmd="rws_cwd=$(remote_path "$CWD")
+"
+    elif [[ -n "$coding_agent" && "$coding_mode" == "resume" ]]; then
+      remote_cmd="$(remote_cwd_preflight_command)
+"
+    else
+      remote_cmd="$(remote_cwd_ensure_command)
+"
+    fi
+  fi
+  local term
+  term=$(shpool_term_value)
+  remote_cmd+="$(remote_shpool_preflight_command)
+TERM=$(sq "$term") $(remote_exec_path "$SHPOOL_BIN") attach"
+  if [[ -n "$CWD" ]]; then
+    remote_cmd+=" -d \"\$rws_cwd\""
+  fi
+  [[ "$force" == "1" ]] && remote_cmd+=" -f"
+  [[ "$background" == "1" ]] && remote_cmd+=" -b"
+  if [[ -n "$coding_agent" ]]; then
+    local shell_cmd
+    shell_cmd=$(coding_agent_shell_command "$coding_agent" "$coding_mode" "$coding_access")
+    remote_cmd+=" -c $(sq "$shell_cmd")"
+  elif [[ "$PROMPT_MODE" == "compact" ]]; then
+    local shell_cmd="env RWS_DEVICE_LABEL=$PROMPT_LABEL sh -lc 'exec \"\${SHELL:-/bin/sh}\" -i'"
+    remote_cmd+=" -c $(sq "$shell_cmd")"
+  fi
+  remote_cmd+=" $(sq "$session")"
+  printf '%s' "$remote_cmd"
+}
+
+shpool_attach() {
+  local session=$1
+  local force=$2
+  local background=$3
+  local coding_agent=${4:-}
+  local coding_mode=${5:-initial}
+  local coding_access=${6:-default}
+  local remote_cmd
+  remote_cmd=$(shpool_attach_command "$session" "$force" "$background" "$coding_agent" "$coding_mode" "$coding_access")
+
+  if [[ "$background" == "1" ]]; then
+    ssh_plain "$remote_cmd"
+    local sessions
+    for _ in $(seq 1 20); do
+      sessions=$(ssh_plain "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") list --json")
+      [[ "$sessions" == *"$session"* ]] && return
+      sleep 0.2
+    done
+    die "failed to create background session: $session"
+  else
+    ssh_tty "$remote_cmd"
+  fi
+}
+
+cmd_check() {
+  ssh_plain_diagnosed "$(remote_check_command)"
+}
+
+cmd_list() {
+  if [[ $# -eq 1 && ( "$1" == "--json" || "$1" == "-j" ) ]]; then
+    ssh_plain "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") list --json"
+  elif [[ $# -eq 0 ]]; then
+    ssh_plain "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") list"
+  else
+    die "list accepts only --json or -j"
+  fi
+}
+
+session_disconnected_in_json() {
+  local json=$1
+  local target=$2
+  awk -v target="$target" '
+    index($0, "\"name\": \"" target "\"") { in_session = 1 }
+    in_session && index($0, "\"status\": \"Disconnected\"") { found = 1 }
+    in_session && index($0, "}") { in_session = 0 }
+    END { exit(found ? 0 : 1) }
+  ' <<< "$json"
+}
+
+cmd_detach() {
+  local targets=("$@")
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    require_session "detach"
+    targets=("$SESSION")
+  fi
+  local target
+  for target in "${targets[@]}"; do
+    validate_session_name "$target"
+  done
+
+  if ssh_plain "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") detach $(join_quoted "${targets[@]}")"; then
+    return 0
+  else
+    local rc=$?
+  fi
+
+  local sessions target
+  sessions=$(ssh_plain "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") list --json") || return "$rc"
+  for target in "${targets[@]}"; do
+    session_disconnected_in_json "$sessions" "$target" || return "$rc"
+  done
+}
+
+cmd_status() {
+  printf '== remote ==\n'
+  cmd_check
+  printf '\n== sessions ==\n'
+  cmd_list || true
+  printf '\n== git ==\n'
+  if [[ -z "$CWD" ]]; then
+    printf 'skipped: no cwd configured for this device\n'
+  else
+    ssh_plain "cd $(remote_path "$CWD") && if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git status --short; else echo 'not a git work tree'; fi"
+  fi
+}
+
+cmd_run() {
+  if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+    usage_run
+    return 0
+  fi
+  if [[ "${1-}" == "--" ]]; then
+    shift
+  fi
+  [[ $# -gt 0 ]] || die "run requires a command"
+  load_selected_device
+  require_cwd "run"
+  ssh_plain "$(remote_cwd_preflight_command)
+exec $(join_quoted "$@")"
+}
+
+fetch_sessions_json() {
+  ssh_plain_diagnosed "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") list --json"
+}
+
+coding_session_may_have_started() {
+  local session=$1
+  local sessions
+  if ! sessions=$(fetch_sessions_json); then
+    # A dropped SSH connection is inconclusive: the remote shpool session may
+    # already be running, so keep the local recovery registration.
+    return 0
+  fi
+  session_exists_in_json "$sessions" "$session"
+}
+
+attach_coding_session() {
+  local session=$1
+  local force=${2:-0}
+  local sessions
+  load_coding_session "$session" || return 1
+  CWD=$CODING_CWD
+  sessions=$(fetch_sessions_json) || return
+  if session_exists_in_json "$sessions" "$session"; then
+    # Do not gate a live attach on prerequisites used only for recovery. Keep
+    # the saved creation options so a list/attach race still recreates safely.
+    shpool_attach "$session" "$force" 0 "$CODING_AGENT" live-resume "$CODING_ACCESS"
+    return
+  fi
+  coding_agent_preflight "$CODING_AGENT" "$CODING_ACCESS"
+  printf 'restoring session: %s (%s, %s, access=%s)\n' \
+    "$session" "$CODING_AGENT" "$CWD" "$CODING_ACCESS" >&2
+  shpool_attach "$session" "$force" 0 "$CODING_AGENT" resume "$CODING_ACCESS"
+}
+
+cmd_new() {
+  local session=
+  local pick_cwd=0
+  local cwd_override=
+  local requested_agent=
+  local requested_access=full
+  local access_explicit=0
+  local access_option=
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage_new
+        return 0
+        ;;
+      -p|--pick-cwd|-pick-cwd)
+        pick_cwd=1
+        shift
+        ;;
+      -C|--cwd)
+        [[ $# -ge 2 ]] || die "--cwd requires a value"
+        cwd_override=$2
+        shift 2
+        ;;
+      -A|--agent)
+        [[ $# -ge 2 ]] || die "--agent requires a value"
+        requested_agent=$2
+        shift 2
+        ;;
+      --full-access)
+        requested_access=full
+        access_explicit=1
+        access_option=--full-access
+        shift
+        ;;
+      --no-full-access)
+        requested_access=default
+        access_explicit=1
+        access_option=--no-full-access
+        shift
+        ;;
+      -*)
+        die "unknown new option: $1"
+        ;;
+      *)
+        if [[ -n "$session" ]]; then
+          die "new accepts exactly one session name"
+        fi
+        session=$1
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$session" ]] || die "new requires exactly one session name"
+  validate_session_name "$session"
+  if [[ -n "$requested_agent" ]]; then
+    validate_coding_agent "$requested_agent"
+  fi
+
+  load_selected_device
+
+  local had_saved=0 saved_agent='' saved_cwd='' saved_access=default
+  if load_coding_session "$session"; then
+    had_saved=1
+    saved_agent=$CODING_AGENT
+    saved_cwd=$CODING_CWD
+    saved_access=$CODING_ACCESS
+    [[ -n "$requested_agent" ]] || requested_agent=$saved_agent
+    if [[ "$access_explicit" == "0" ]]; then
+      requested_access=$saved_access
+    fi
+    if [[ -z "$cwd_override" && "$pick_cwd" == "0" ]]; then
+      CWD=$saved_cwd
+    fi
+  fi
+  if [[ "$access_explicit" == "1" && -z "$requested_agent" ]]; then
+    die "$access_option requires --agent codex, --agent claude, or --agent kiro"
+  fi
+  if [[ -n "$cwd_override" ]]; then
+    validate_cwd_value "$cwd_override"
+    CWD=$cwd_override
+  fi
+  if [[ "$pick_cwd" == "1" ]]; then
+    pick_remote_cwd
+  elif [[ -z "$CWD" ]]; then
+    if [[ -t 0 ]]; then
+      printf 'No default cwd is configured for this device. Select a cwd for this session.\n' >&2
+      pick_remote_cwd
+    else
+      die "new requires --cwd DIR or --pick-cwd because device has no default cwd"
+    fi
+  fi
+
+  local sessions is_live=0
+  sessions=$(fetch_sessions_json) || return
+  if session_exists_in_json "$sessions" "$session"; then
+    is_live=1
+  fi
+
+  if [[ "$is_live" == "1" ]]; then
+    if [[ -n "$requested_agent" ]]; then
+      if [[ "$had_saved" != "1" || "$requested_agent" != "$saved_agent" || "$CWD" != "$saved_cwd" || "$requested_access" != "$saved_access" ]]; then
+        die "session already exists: $session. Use another name or kill it before changing its coding-agent configuration"
+      fi
+      # Keep recovery parameters on the attach request so a session lost after
+      # the preceding list is recreated as the registered coding session.
+      # Checks for recovery-only prerequisites must not block a live reattach.
+      shpool_attach "$session" 0 0 "$requested_agent" live-resume "$requested_access"
+    else
+      shpool_attach "$session" 0 0
+    fi
+    return
+  fi
+
+  if [[ -n "$requested_agent" ]]; then
+    coding_agent_preflight "$requested_agent" "$requested_access"
+    if [[ "$had_saved" == "1" && "$requested_agent" == "$saved_agent" && "$CWD" == "$saved_cwd" ]]; then
+      if [[ "$requested_access" != "$saved_access" ]]; then
+        write_coding_session "$session" "$requested_agent" "$CWD" "$requested_access"
+      fi
+      printf 'restoring session: %s (%s, %s, access=%s)\n' \
+        "$session" "$requested_agent" "$CWD" "$requested_access" >&2
+      if ! shpool_attach "$session" 0 0 "$requested_agent" resume "$requested_access"; then
+        if coding_session_may_have_started "$session"; then
+          return 1
+        fi
+        if [[ "$requested_access" != "$saved_access" ]]; then
+          write_coding_session "$session" "$saved_agent" "$saved_cwd" "$saved_access"
+        fi
+        return 1
+      fi
+    else
+      write_coding_session "$session" "$requested_agent" "$CWD" "$requested_access"
+      if ! shpool_attach "$session" 0 0 "$requested_agent" initial "$requested_access"; then
+        if coding_session_may_have_started "$session"; then
+          return 1
+        fi
+        if [[ "$had_saved" == "1" ]]; then
+          write_coding_session "$session" "$saved_agent" "$saved_cwd" "$saved_access"
+        else
+          remove_coding_session "$session"
+        fi
+        return 1
+      fi
+    fi
+    return
+  fi
+
+  shpool_attach "$session" 0 0
+}
+
+session_exists_in_json() {
+  local json=$1
+  local target=$2
+  awk -v target="$target" '
+    { json = json $0 ORS }
+    END {
+      # validate_session_name limits targets to alphanumerics, dot, underscore,
+      # and hyphen. Dot is the only ERE metacharacter in that set.
+      gsub(/[.]/, "[.]", target)
+      pattern = "\"name\"[[:space:]]*:[[:space:]]*\"" target "\""
+      exit json ~ pattern ? 0 : 1
+    }
+  ' <<< "$json"
+}
+
+ensure_session_exists() {
+  local session=$1
+  local sessions
+  sessions=$(fetch_sessions_json) || return
+  if ! session_exists_in_json "$sessions" "$session"; then
+    die "session not found: $session. Run: rws new $session"
+  fi
+}
+
+session_object_from_json() {
+  local json=$1
+  local target=$2
+  awk -v target="$target" '
+    function brace_delta(line, i, c, delta) {
+      delta = 0
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (c == "{") delta++
+        if (c == "}") delta--
+      }
+      return delta
+    }
+    /"sessions"[[:space:]]*:/ { in_sessions = 1 }
+    in_sessions && !in_obj && /^[[:space:]]*\{/ {
+      in_obj = 1
+      depth = 0
+      matched = 0
+      buf = ""
+    }
+    in_obj {
+      line = $0
+      if (index(line, "\"name\": \"" target "\"")) matched = 1
+      next_depth = depth + brace_delta(line)
+      if (next_depth == 0 && matched) {
+        sub(/[[:space:]]*,[[:space:]]*$/, "", line)
+      }
+      buf = buf line ORS
+      depth = next_depth
+      if (depth == 0) {
+        if (matched) {
+          printf "%s", buf
+          found = 1
+          exit
+        }
+        in_obj = 0
+        matched = 0
+        buf = ""
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' <<< "$json"
+}
+
+cmd_session_create() {
+  [[ $# -ge 1 ]] || die "session create requires SESSION"
+  local session=$1
+  shift
+  local cwd_override=
+  local pick_cwd=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -C|--cwd)
+        [[ $# -ge 2 ]] || die "--cwd requires a value"
+        cwd_override=$2
+        shift 2
+        ;;
+      -p|--pick-cwd|-pick-cwd)
+        pick_cwd=1
+        shift
+        ;;
+      *)
+        die "unknown session create option: $1"
+        ;;
+    esac
+  done
+  validate_session_name "$session"
+  if [[ -n "$cwd_override" ]]; then
+    validate_cwd_value "$cwd_override"
+    CWD=$cwd_override
+  fi
+  if [[ "$pick_cwd" == "1" ]]; then
+    pick_remote_cwd
+  elif [[ -z "$CWD" ]]; then
+    die "session create requires --cwd DIR or --pick-cwd because device has no default cwd"
+  fi
+  if coding_session_exists "$session"; then
+    die "session with agent metadata must be resumed interactively: rws attach $session"
+  fi
+  shpool_attach "$session" 0 1
+  printf 'created session: %s\n' "$session"
+}
+
+cmd_session_get() {
+  [[ $# -ge 1 ]] || die "session get requires SESSION"
+  local session=$1
+  shift
+  [[ $# -eq 0 ]] || die "session get accepts exactly one SESSION"
+  validate_session_name "$session"
+  local sessions
+  sessions=$(ssh_plain "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") list --json")
+  local session_json
+  if ! session_json=$(session_object_from_json "$sessions" "$session"); then
+    die "session not found: $session"
+  fi
+  printf '%s\n' "$session_json"
+}
+
+cmd_session_update() {
+  [[ $# -ge 1 ]] || die "session update requires SESSION"
+  local session=$1
+  shift
+  validate_session_name "$session"
+  [[ $# -gt 0 ]] || die "session update requires an operation, such as --detach"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --detach)
+        cmd_detach "$session"
+        shift
+        ;;
+      *)
+        die "unknown session update option: $1"
+        ;;
+    esac
+  done
+}
+
+cmd_session_delete() {
+  [[ $# -ge 1 ]] || die "session delete requires SESSION"
+  local target sessions
+  local live_targets=()
+  for target in "$@"; do
+    validate_session_name "$target"
+  done
+  sessions=$(fetch_sessions_json) || return
+  for target in "$@"; do
+    if session_exists_in_json "$sessions" "$target"; then
+      live_targets+=("$target")
+    fi
+  done
+  if [[ ${#live_targets[@]} -gt 0 ]]; then
+    ssh_plain "$(remote_shpool_preflight_command)
+$(remote_exec_path "$SHPOOL_BIN") kill $(join_quoted "${live_targets[@]}")"
+  fi
+  for target in "$@"; do
+    if coding_session_exists "$target"; then
+      remove_coding_session "$target"
+    fi
+  done
+}
+
+cmd_session() {
+  local sub=${1:-list}
+  [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    -h|--help|help)
+      usage_session
+      ;;
+    create|add)
+      cmd_session_create "$@"
+      ;;
+    get|show|read)
+      cmd_session_get "$@"
+      ;;
+    list|ls|'')
+      cmd_list "$@"
+      ;;
+    update)
+      cmd_session_update "$@"
+      ;;
+    delete|remove|rm|kill)
+      cmd_session_delete "$@"
+      ;;
+    attach)
+      local explicit=0
+      if [[ $# -gt 0 ]]; then
+        SESSION=$1
+        explicit=1
+        shift
+        [[ $# -eq 0 ]] || die "session attach accepts at most one SESSION"
+      fi
+      require_session "session attach"
+      if coding_session_exists "$SESSION"; then
+        attach_coding_session "$SESSION" 0
+        return
+      fi
+      if [[ "$explicit" == "1" || -z "$CWD" ]]; then
+        ensure_session_exists "$SESSION"
+      fi
+      shpool_attach "$SESSION" 0 0
+      ;;
+    *)
+      die "unknown session command: $sub"
+      ;;
+  esac
+}
+
+cmd_devices() {
+  [[ $# -eq 0 ]] || die "device list accepts no arguments"
+  select_config_dir
+  local config_file
+  for config_file in "$CONFIG_DIR"/devices/*.conf; do
+    [[ -e "$config_file" ]] || continue
+    basename "$config_file" .conf
+  done
+}
+
+validate_device_name() {
+  local device=$1
+  [[ -n "$device" ]] || die "device name is required"
+  case "$device" in
+    .*|-*|*/*|*..*|*[!A-Za-z0-9._-]*)
+      die "invalid device name: $device"
+      ;;
+  esac
+}
+
+validate_session_name() {
+  local session=$1
+  [[ -n "$session" ]] || die "session name is required"
+  case "$session" in
+    .*|-*|*/*|*..*|*[!A-Za-z0-9._-]*)
+      die "invalid session name: $session"
+      ;;
+  esac
+}
+
+validate_coding_agent() {
+  local agent=$1
+  case "$agent" in
+    codex|claude|kiro)
+      ;;
+    *)
+      die "invalid coding agent: $agent (expected codex, claude, or kiro)"
+      ;;
+  esac
+}
+
+validate_coding_access() {
+  local access=$1
+  case "$access" in
+    default|full)
+      ;;
+    *)
+      die "invalid coding agent access mode: $access"
+      ;;
+  esac
+}
+
+validate_cwd_value() {
+  local cwd=$1
+  [[ -n "$cwd" ]] || die "cwd is required"
+  if printf '%s' "$cwd" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "invalid cwd: control characters are not allowed"
+  fi
+}
+
+validate_prompt_mode() {
+  local mode=$1
+  case "$mode" in
+    compact|skip)
+      ;;
+    *)
+      die "invalid prompt mode: $mode"
+      ;;
+  esac
+}
+
+validate_prompt_label() {
+  local label=$1
+  [[ -n "$label" ]] || die "prompt label is required"
+  case "$label" in
+    .*|-*|*/*|*..*|*[!A-Za-z0-9._-]*)
+      die "invalid prompt label: $label"
+      ;;
+  esac
+}
+
+default_device_name() {
+  local file=$1
+  local line
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%%#*}
+    line=$(trim "$line")
+    [[ "$line" == device=* ]] || continue
+    printf '%s' "$(unquote "$(trim "${line#*=}")")"
+    return 0
+  done < "$file"
+}
+
+write_default_device() {
+  local config_dir=$1
+  local device=$2
+  mkdir -p "$config_dir"
+  {
+    printf '# Default device for rws.\n'
+    printf 'device=%s\n' "$device"
+  } > "$config_dir/default.conf"
+}
+
+cmd_remove_device() {
+  [[ $# -le 1 ]] || die "remove accepts at most one DEVICE"
+  select_config_dir
+  local target
+  if [[ $# -gt 0 ]]; then
+    target=$1
+    shift
+  else
+    load_config "$CONFIG_DIR/default.conf"
+    if [[ -n "$DEVICE_OVERRIDE" ]]; then
+      DEVICE=$DEVICE_OVERRIDE
+    fi
+    target=$DEVICE
+  fi
+  validate_device_name "$target"
+
+  local device_file="$CONFIG_DIR/devices/$target.conf"
+  [[ -f "$device_file" ]] || die "device not found: $target"
+  rm -f "$device_file"
+  rm -rf "$CONFIG_DIR/sessions/$target"
+  rmdir "$CONFIG_DIR/sessions" 2>/dev/null || true
+
+  local current_default next_device next_file
+  current_default=$(default_device_name "$CONFIG_DIR/default.conf")
+  if [[ "$current_default" == "$target" ]]; then
+    next_device=
+    for next_file in "$CONFIG_DIR"/devices/*.conf; do
+      [[ -e "$next_file" ]] || continue
+      next_device=$(basename "$next_file" .conf)
+      break
+    done
+    if [[ -n "$next_device" ]]; then
+      {
+        printf '# Default device for rws.\n'
+        printf 'device=%s\n' "$next_device"
+      } > "$CONFIG_DIR/default.conf"
+      printf 'removed %s; default device is now %s\n' "$target" "$next_device"
+    else
+      rm -f "$CONFIG_DIR/default.conf"
+      printf 'removed %s; no devices remain\n' "$target"
+    fi
+  else
+    printf 'removed %s\n' "$target"
+  fi
+}
+
+set_device_key() {
+  local device=$1
+  local key=$2
+  local value=$3
+  local config_dir
+  config_dir=$(write_config_dir)
+  local file="$config_dir/devices/$device.conf"
+  local tmp="$file.tmp.$$"
+  local found=0
+  local line current_key
+
+  [[ -f "$file" ]] || die "device not found: $device"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    current_key=${line%%=*}
+    if [[ "$current_key" == "$key" ]]; then
+      printf '%s=%s\n' "$key" "$value"
+      found=1
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$file" > "$tmp"
+  if [[ "$found" != "1" ]]; then
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  fi
+  mv "$tmp" "$file"
+}
+
+remove_device_key() {
+  local device=$1
+  local key=$2
+  local config_dir
+  config_dir=$(write_config_dir)
+  local file="$config_dir/devices/$device.conf"
+  local tmp="$file.tmp.$$"
+  local line current_key
+
+  [[ -f "$file" ]] || die "device not found: $device"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    current_key=${line%%=*}
+    [[ "$current_key" == "$key" ]] && continue
+    printf '%s\n' "$line"
+  done < "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+replace_device_multi_key() {
+  local device=$1
+  local key=$2
+  shift 2
+  local value
+  local config_dir
+  config_dir=$(write_config_dir)
+  local file="$config_dir/devices/$device.conf"
+
+  remove_device_key "$device" "$key"
+  [[ -f "$file" ]] || die "device not found: $device"
+  for value in "$@"; do
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  done
+}
+
+resolve_config_device_arg() {
+  local target=${1-}
+  select_config_dir
+  if [[ -z "$target" ]]; then
+    load_config "$CONFIG_DIR/default.conf"
+    if [[ -n "$DEVICE_OVERRIDE" ]]; then
+      target=$DEVICE_OVERRIDE
+    else
+      target=$DEVICE
+    fi
+  fi
+  validate_device_name "$target"
+  printf '%s' "$target"
+}
+
+cmd_device_create() {
+  [[ $# -ge 1 ]] || die "device create requires DEVICE"
+  local target=$1
+  shift
+  validate_device_name "$target"
+  cmd_setup --device "$target" "$@"
+}
+
+cmd_device_get() {
+  select_config_dir
+  local target
+  if [[ $# -gt 0 ]]; then
+    target=$1
+    shift
+    [[ $# -eq 0 ]] || die "device get accepts at most one DEVICE"
+  else
+    target=
+  fi
+  target=$(resolve_config_device_arg "$target")
+  local file="$CONFIG_DIR/devices/$target.conf"
+  [[ -f "$file" ]] || die "device not found: $target"
+  cat "$file"
+}
+
+cmd_device_update() {
+  [[ $# -ge 1 ]] || die "device update requires DEVICE"
+  select_config_dir
+  local target=$1
+  shift
+  validate_device_name "$target"
+  local file="$CONFIG_DIR/devices/$target.conf"
+  [[ -f "$file" ]] || die "device not found: $target"
+
+  local make_default=0
+  local clear_ssh_options=0
+  local prompt_mode_set=0
+  local prompt_label_set=0
+  local ssh_options=()
+  local key value
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -H|--host)
+        [[ $# -ge 2 ]] || die "--host requires a value"
+        set_device_key "$target" host "$2"
+        shift 2
+        ;;
+      -C|--cwd)
+        [[ $# -ge 2 ]] || die "--cwd requires a value"
+        validate_cwd_value "$2"
+        set_device_key "$target" cwd "$2"
+        shift 2
+        ;;
+      -s|--session|--default-session)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        validate_session_name "$2"
+        set_device_key "$target" default_session "$2"
+        shift 2
+        ;;
+      -i|--identity-file)
+        [[ $# -ge 2 ]] || die "--identity-file requires a value"
+        set_device_key "$target" identity_file "$2"
+        shift 2
+        ;;
+      --clear-identity-file)
+        remove_device_key "$target" identity_file
+        shift
+        ;;
+      -B|--shpool-bin)
+        [[ $# -ge 2 ]] || die "--shpool-bin requires a value"
+        set_device_key "$target" shpool_bin "$2"
+        shift 2
+        ;;
+      -m|--prompt-mode)
+        [[ $# -ge 2 ]] || die "--prompt-mode requires a value"
+        validate_prompt_mode "$2"
+        set_device_key "$target" prompt_mode "$2"
+        prompt_mode_set=1
+        value=$2
+        shift 2
+        ;;
+      -l|--prompt-label)
+        [[ $# -ge 2 ]] || die "--prompt-label requires a value"
+        validate_prompt_label "$2"
+        set_device_key "$target" prompt_label "$2"
+        prompt_label_set=1
+        shift 2
+        ;;
+      --clear-prompt-label)
+        remove_device_key "$target" prompt_label
+        prompt_label_set=1
+        shift
+        ;;
+      -o|--ssh-option)
+        [[ $# -ge 2 ]] || die "--ssh-option requires a value"
+        ssh_options+=("$2")
+        shift 2
+        ;;
+      --clear-ssh-options)
+        clear_ssh_options=1
+        shift
+        ;;
+      --default)
+        make_default=1
+        shift
+        ;;
+      *)
+        die "unknown device update option: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$clear_ssh_options" == "1" || ${#ssh_options[@]} -gt 0 ]]; then
+    if [[ ${#ssh_options[@]} -gt 0 ]]; then
+      replace_device_multi_key "$target" ssh_option "${ssh_options[@]}"
+    else
+      replace_device_multi_key "$target" ssh_option
+    fi
+  fi
+  if [[ "$prompt_mode_set" == "1" && "$value" == "skip" && "$prompt_label_set" != "1" ]]; then
+    remove_device_key "$target" prompt_label
+  fi
+  if [[ "$make_default" == "1" ]]; then
+    write_default_device "$CONFIG_DIR" "$target"
+  fi
+  printf 'updated %s\n' "$target"
+}
+
+prompt_default() {
+  local label=$1
+  local default=$2
+  local value
+  printf '%s [%s]: ' "$label" "$default" >&2
+  read -r value || setup_cancel
+  if prompt_cancel_requested "$value"; then
+    setup_cancel
+  fi
+  if [[ -z "$value" ]]; then
+    printf '%s' "$default"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+prompt_required() {
+  local label=$1
+  local value
+  while true; do
+    printf '%s: ' "$label" >&2
+    read -r value || setup_cancel
+    if prompt_cancel_requested "$value"; then
+      setup_cancel
+    fi
+    if [[ -n "$value" ]]; then
+      printf '%s' "$value"
+      return
+    fi
+  done
+}
+
+prompt_cancel_requested() {
+  local value
+  value=$(trim "$1")
+  case "$value" in
+    q|Q|quit|QUIT|Quit|exit|EXIT|Exit)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+setup_cancel() {
+  printf 'rws: setup canceled\n' >&2
+  exit 130
+}
+
+default_existing_identity_file() {
+  if [[ -f "$HOME/.ssh/id_ed25519" ]]; then
+    printf '~/.ssh/id_ed25519'
+  elif [[ -f "$HOME/.ssh/id_rsa" ]]; then
+    printf '~/.ssh/id_rsa'
+  else
+    printf '~/.ssh/id_ed25519'
+  fi
+}
+
+resolve_identity_file_for_key() {
+  local identity_file=${1-}
+  if [[ -n "$identity_file" ]]; then
+    printf '%s' "$identity_file"
+    return 0
+  fi
+
+  load_selected_device
+  if [[ -n "$IDENTITY_FILE" ]]; then
+    printf '%s' "$IDENTITY_FILE"
+  else
+    printf '~/.ssh/rws_%s_ed25519' "$DEVICE"
+  fi
+}
+
+ensure_public_key_file() {
+  local key_path=$1
+  check_local_ssh_keygen
+  [[ -f "$key_path" ]] || die "identity file not found: $key_path"
+  if [[ ! -f "$key_path.pub" ]]; then
+    ssh-keygen -y -f "$key_path" > "$key_path.pub"
+  fi
+  chmod 600 "$key_path"
+  chmod 644 "$key_path.pub"
+}
+
+create_identity_file() {
+  check_local_ssh_keygen
+  local identity_file=$1
+  local force=$2
+  local key_path
+  key_path=$(local_path "$identity_file")
+  mkdir -p "$(dirname "$key_path")"
+
+  if [[ -e "$key_path" && "$force" != "1" ]]; then
+    ensure_public_key_file "$key_path"
+    printf 'using existing identity file: %s\n' "$key_path"
+    return 0
+  fi
+  if [[ "$force" == "1" ]]; then
+    rm -f "$key_path" "$key_path.pub"
+  fi
+  ssh-keygen -t ed25519 -N '' -C "rws:key" -f "$key_path" >/dev/null
+  chmod 600 "$key_path"
+  chmod 644 "$key_path.pub"
+  printf 'created identity file: %s\n' "$key_path"
+}
+
+cmd_key_create() {
+  local identity_file=
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --identity-file|-i)
+        [[ $# -ge 2 ]] || die "--identity-file requires a value"
+        identity_file=$2
+        shift 2
+        ;;
+      -f|--force)
+        force=1
+        shift
+        ;;
+      *)
+        die "unknown key create option: $1"
+        ;;
+    esac
+  done
+  identity_file=$(resolve_identity_file_for_key "$identity_file")
+  create_identity_file "$identity_file" "$force"
+}
+
+cmd_key_get() {
+  local identity_file=
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --identity-file|-i)
+        [[ $# -ge 2 ]] || die "--identity-file requires a value"
+        identity_file=$2
+        shift 2
+        ;;
+      *)
+        die "unknown key get option: $1"
+        ;;
+    esac
+  done
+  identity_file=$(resolve_identity_file_for_key "$identity_file")
+  local key_path
+  key_path=$(local_path "$identity_file")
+  printf 'identity_file=%s\n' "$identity_file"
+  if [[ -f "$key_path" ]]; then
+    printf 'private_key=present\n'
+  else
+    printf 'private_key=missing\n'
+  fi
+  if [[ -f "$key_path.pub" ]]; then
+    check_local_ssh_keygen
+    printf 'public_key=present\n'
+    printf 'fingerprint='
+    ssh-keygen -lf "$key_path.pub" | awk '{print $2}'
+  else
+    printf 'public_key=missing\n'
+  fi
+}
+
+cmd_key_list() {
+  [[ $# -eq 0 ]] || die "key list accepts no arguments"
+  select_config_dir
+  local file device identity_file key_path status
+  for file in "$CONFIG_DIR"/devices/*.conf; do
+    [[ -e "$file" ]] || continue
+    device=$(basename "$file" .conf)
+    identity_file=$(awk -F= '$1 == "identity_file" { print $2; found=1; exit } END { if (!found) print "" }' "$file")
+    if [[ -z "$identity_file" ]]; then
+      printf '%s\t%s\t%s\n' "$device" "-" "unconfigured"
+      continue
+    fi
+    key_path=$(local_path "$identity_file")
+    if [[ -f "$key_path" ]]; then
+      status=present
+    else
+      status=missing
+    fi
+    printf '%s\t%s\t%s\n' "$device" "$identity_file" "$status"
+  done
+}
+
+cmd_key_update() {
+  local identity_file=
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --identity-file|-i)
+        [[ $# -ge 2 ]] || die "--identity-file requires a value"
+        identity_file=$2
+        shift 2
+        ;;
+      -f|--force)
+        force=1
+        shift
+        ;;
+      *)
+        die "unknown key update option: $1"
+        ;;
+    esac
+  done
+  [[ "$force" == "1" ]] || die "key update regenerates the identity file; pass --force to confirm"
+  identity_file=$(resolve_identity_file_for_key "$identity_file")
+  create_identity_file "$identity_file" 1
+}
+
+cmd_key_remove() {
+  local identity_file=
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --identity-file|-i)
+        [[ $# -ge 2 ]] || die "--identity-file requires a value"
+        identity_file=$2
+        shift 2
+        ;;
+      -f|--force)
+        force=1
+        shift
+        ;;
+      *)
+        die "unknown key remove option: $1"
+        ;;
+    esac
+  done
+  [[ "$force" == "1" ]] || die "key remove deletes local key files; pass --force to confirm"
+  identity_file=$(resolve_identity_file_for_key "$identity_file")
+  local key_path
+  key_path=$(local_path "$identity_file")
+  rm -f "$key_path" "$key_path.pub"
+  printf 'removed identity file: %s\n' "$key_path"
+}
+
+cmd_key() {
+  local sub=${1:-list}
+  [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    -h|--help|help)
+      usage_key
+      ;;
+    create|add)
+      cmd_key_create "$@"
+      ;;
+    get|show|read)
+      cmd_key_get "$@"
+      ;;
+    list|ls|'')
+      cmd_key_list "$@"
+      ;;
+    update)
+      cmd_key_update "$@"
+      ;;
+    remove|rm|delete)
+      cmd_key_remove "$@"
+      ;;
+    *)
+      die "unknown key command: $sub"
+      ;;
+  esac
+}
+
+prompt_yes_no() {
+  local label=$1
+  local default=$2
+  local value suffix
+  if [[ "$default" == "yes" ]]; then
+    suffix='Y/n'
+  else
+    suffix='y/N'
+  fi
+  while true; do
+    printf '%s [%s]: ' "$label" "$suffix" >&2
+    read -r value || setup_cancel
+    value=$(trim "$value")
+    if prompt_cancel_requested "$value"; then
+      setup_cancel
+    fi
+    if [[ -z "$value" ]]; then
+      [[ "$default" == "yes" ]] && return 0 || return 1
+    fi
+    case "$value" in
+      y|Y|yes|YES|Yes)
+        return 0
+        ;;
+      n|N|no|NO|No)
+        return 1
+        ;;
+      *)
+        printf 'Please answer yes or no.\n' >&2
+        ;;
+    esac
+  done
+}
+
+prompt_existing_device_action() {
+  local device=$1
+  local file=$2
+  local value
+  printf 'Existing device config found: %s\n' "$device" >&2
+  printf '  config: %s\n' "$file" >&2
+  printf '  1) continue with saved values\n' >&2
+  printf '  2) reset and replace it\n' >&2
+  printf '  q) quit setup\n' >&2
+  while true; do
+    printf 'Choose [1/2/q] [1]: ' >&2
+    read -r value || setup_cancel
+    value=$(trim "$value")
+    if [[ -z "$value" ]]; then
+      printf 'continue'
+      return
+    fi
+    if prompt_cancel_requested "$value"; then
+      setup_cancel
+    fi
+    case "$value" in
+      1|c|C|continue|Continue|CONTINUE)
+        printf 'continue'
+        return
+        ;;
+      2|r|R|reset|Reset|RESET)
+        printf 'reset'
+        return
+        ;;
+      *)
+        printf 'Please choose 1, 2, or q.\n' >&2
+        ;;
+    esac
+  done
+}
+
+default_login_user() {
+  id -un 2>/dev/null || whoami 2>/dev/null || printf 'user'
+}
+
+prompt_ssh_host() {
+  local current=$1
+  local host_part user_part
+  if [[ -n "$current" ]]; then
+    prompt_default "SSH host, for example user@workstation" "$current"
+    return
+  fi
+  host_part=$(prompt_required "Remote host or IP")
+  if [[ "$host_part" == *@* ]]; then
+    printf '%s' "$host_part"
+    return
+  fi
+  user_part=$(prompt_default "Remote SSH user (default is local user)" "$(default_login_user)")
+  printf '%s@%s' "$user_part" "$host_part"
+}
+
+install_local_openssh() {
+  if command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1; then
+    return
+  fi
+
+  run_local_root() {
+    if [[ "$(id -u)" == "0" ]]; then
+      "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo "$@"
+    else
+      return 127
+    fi
+  }
+
+  printf 'Installing local OpenSSH client tools...\n' >&2
+  if command -v brew >/dev/null 2>&1; then
+    brew install openssh
+  elif command -v apt-get >/dev/null 2>&1; then
+    run_local_root apt-get update
+    run_local_root apt-get install -y openssh-client
+  elif command -v dnf >/dev/null 2>&1; then
+    run_local_root dnf install -y openssh-clients
+  elif command -v yum >/dev/null 2>&1; then
+    run_local_root yum install -y openssh-clients
+  elif command -v pacman >/dev/null 2>&1; then
+    run_local_root pacman -Sy --noconfirm openssh
+  elif command -v apk >/dev/null 2>&1; then
+    run_local_root apk add --no-cache openssh-client
+  else
+    die "missing ssh or ssh-keygen and no supported local package manager was found"
+  fi
+
+  command -v ssh >/dev/null 2>&1 || die "ssh is still unavailable after installation"
+  command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is still unavailable after installation"
+}
+
+check_local_openssh() {
+  check_local_ssh
+  check_local_ssh_keygen
+}
+
+check_local_ssh() {
+  command -v ssh >/dev/null 2>&1 || die "missing local dependency: ssh (run: rws setup)"
+}
+
+check_local_ssh_keygen() {
+  command -v ssh-keygen >/dev/null 2>&1 || die "missing local dependency: ssh-keygen (run: rws setup)"
+}
+
+setup_ssh_args() {
+  local args=()
+  local option
+  if [[ -n "${SETUP_CONTROL_PATH:-}" && "${SETUP_CONTROL_OPENED:-0}" == "1" ]]; then
+    args+=(-S "$SETUP_CONTROL_PATH" -o ControlMaster=no)
+  elif [[ -n "${bootstrap_identity:-}" ]]; then
+    args+=(-i "$(local_path "$bootstrap_identity")")
+  elif [[ -n "${identity_file:-}" ]]; then
+    args+=(-i "$(local_path "$identity_file")")
+  fi
+  if [[ ${#ssh_options[@]} -gt 0 ]]; then
+    for option in "${ssh_options[@]}"; do
+      args+=(-o "$option")
+    done
+  fi
+  if [[ ${#args[@]} -gt 0 ]]; then
+    printf '%s\0' "${args[@]}"
+  fi
+}
+
+setup_prepare_control_master() {
+  [[ -n "$SETUP_CONTROL_PATH" ]] && return
+  SETUP_CONTROL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rws-ssh.XXXXXX")
+  SETUP_CONTROL_PATH="$SETUP_CONTROL_DIR/control"
+  SETUP_CONTROL_HOST=$init_host
+}
+
+setup_open_control_master() {
+  [[ -n "$SETUP_CONTROL_PATH" ]] || return
+  [[ "$SETUP_CONTROL_OPENED" == "1" ]] && return
+
+  local args=()
+  local option
+  local connect_identity=${identity_file:-}
+  if [[ -n "${bootstrap_identity:-}" ]]; then
+    connect_identity=$bootstrap_identity
+  fi
+  if [[ -n "$connect_identity" && -f "$(local_path "$connect_identity")" ]]; then
+    args+=(-i "$(local_path "$connect_identity")")
+  fi
+  if [[ ${#ssh_options[@]} -gt 0 ]]; then
+    for option in "${ssh_options[@]}"; do
+      args+=(-o "$option")
+    done
+  fi
+
+  printf 'Connecting to %s. Enter the remote SSH password if prompted.\n' "$init_host" >&2
+  if [[ ${#args[@]} -gt 0 ]]; then
+    if ssh -M -S "$SETUP_CONTROL_PATH" -o ControlMaster=yes -o ControlPersist=10m -fN "${args[@]}" "$init_host"; then
+      SETUP_CONTROL_OPENED=1
+    else
+      die "SSH connection failed. Check the host, username, or password, then run rws setup again"
+    fi
+  else
+    if ssh -M -S "$SETUP_CONTROL_PATH" -o ControlMaster=yes -o ControlPersist=10m -fN "$init_host"; then
+      SETUP_CONTROL_OPENED=1
+    else
+      die "SSH connection failed. Check the host, username, or password, then run rws setup again"
+    fi
+  fi
+}
+
+setup_close_control_master() {
+  if [[ -n "${SETUP_CONTROL_PATH:-}" && "${SETUP_CONTROL_OPENED:-0}" == "1" ]]; then
+    ssh -S "$SETUP_CONTROL_PATH" -O exit "$SETUP_CONTROL_HOST" >/dev/null 2>&1 || true
+    SETUP_CONTROL_OPENED=0
+  fi
+  if [[ -n "${SETUP_CONTROL_DIR:-}" ]]; then
+    rm -rf "$SETUP_CONTROL_DIR"
+    SETUP_CONTROL_DIR=
+    SETUP_CONTROL_PATH=
+    SETUP_CONTROL_HOST=
+  fi
+}
+trap setup_close_control_master EXIT
+
+setup_ssh_run() {
+  local remote_cmd=$1
+  local args=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(setup_ssh_args)
+
+  if [[ -t 0 ]]; then
+    if [[ ${#args[@]} -gt 0 ]]; then
+      ssh -tt "${args[@]}" "$init_host" "$remote_cmd"
+    else
+      ssh -tt "$init_host" "$remote_cmd"
+    fi
+  else
+    if [[ ${#args[@]} -gt 0 ]]; then
+      ssh -o BatchMode=yes "${args[@]}" "$init_host" "$remote_cmd"
+    else
+      ssh -o BatchMode=yes "$init_host" "$remote_cmd"
+    fi
+  fi
+}
+
+setup_ssh_run_plain() {
+  local remote_cmd=$1
+  local args=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(setup_ssh_args)
+
+  if [[ ${#args[@]} -gt 0 ]]; then
+    ssh "${args[@]}" "$init_host" "$remote_cmd"
+  else
+    ssh "$init_host" "$remote_cmd"
+  fi
+}
+
+setup_ssh_run_capture() {
+  local output_file=$1
+  local remote_cmd=$2
+  local args=()
+  local arg status
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(setup_ssh_args)
+
+  set +e
+  if [[ -t 0 && ${#args[@]} -gt 0 ]]; then
+    ssh -tt "${args[@]}" "$init_host" "$remote_cmd" | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  elif [[ -t 0 ]]; then
+    ssh -tt "$init_host" "$remote_cmd" | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  elif [[ ${#args[@]} -gt 0 ]]; then
+    ssh "${args[@]}" "$init_host" "$remote_cmd" 2>&1 | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  else
+    ssh "$init_host" "$remote_cmd" 2>&1 | tee "$output_file" >&2
+    status=${PIPESTATUS[0]}
+  fi
+  set -e
+  return "$status"
+}
+
+setup_remote_prereqs() {
+  [[ "$remote_install" == "skip" ]] && return
+
+  if [[ -n "${SETUP_CONTROL_PATH:-}" && "${SETUP_CONTROL_OPENED:-0}" != "1" ]]; then
+    setup_open_control_master
+  fi
+
+  local remote_cwd_command='' remote_cwd_summary remote_cmd
+  remote_cwd_summary='printf "remote cwd: (not set)\n"'
+  remote_cmd="
+set -eu
+rws_remote_install=$(sq "$remote_install")
+rws_shpool_version=$(sq "$shpool_version")
+rws_interactive=$(if [[ -t 0 ]]; then printf '1'; else printf '0'; fi)
+$remote_cwd_command
+
+rws_run_root() {
+  if [ \"\$(id -u)\" = 0 ]; then
+    \"\$@\"
+  elif command -v sudo >/dev/null 2>&1; then
+    if [ \"\$rws_interactive\" != 1 ] && ! sudo -n true >/dev/null 2>&1; then
+      echo 'rws: installing remote dependencies requires root or passwordless sudo in non-interactive mode' >&2
+      echo 'rws: rerun rws setup interactively, or preinstall cargo/shpool and rerun setup' >&2
+      exit 2
+    fi
+    sudo \"\$@\"
+  else
+    echo 'rws: installing remote dependencies requires root or sudo' >&2
+    echo 'rws: preinstall cargo/shpool or ask an administrator to grant install rights' >&2
+    return 127
+  fi
+}
+
+rws_find_cargo() {
+  if command -v cargo >/dev/null 2>&1 && cargo --version >/dev/null 2>&1; then
+    return 0
+  fi
+  for rws_cargo_path in \"\$HOME/.cargo/bin/cargo\" /usr/local/cargo/bin/cargo /usr/local/rustup/toolchains/*/bin/cargo; do
+    if [ -x \"\$rws_cargo_path\" ]; then
+      case \"\$rws_cargo_path\" in
+        /usr/local/rustup/toolchains/*/bin/cargo)
+          RUSTUP_TOOLCHAIN=\"\$(basename \"\$(dirname \"\$(dirname \"\$rws_cargo_path\")\")\")\"
+          export RUSTUP_TOOLCHAIN
+          ;;
+      esac
+      PATH=\"\$(dirname \"\$rws_cargo_path\"):\$PATH\"
+      export PATH
+      cargo --version >/dev/null 2>&1 && return 0
+    fi
+  done
+  return 1
+}
+
+rws_install_cargo() {
+  if rws_find_cargo; then
+    return
+  fi
+  echo 'rws: installing remote cargo/build prerequisites; this may take several minutes' >&2
+  if command -v apt-get >/dev/null 2>&1; then
+    rws_run_root apt-get update >&2
+    rws_run_root apt-get install -y cargo pkg-config libssl-dev build-essential >&2
+  elif command -v dnf >/dev/null 2>&1; then
+    rws_run_root dnf install -y cargo rust pkgconf-pkg-config openssl-devel gcc >&2
+  elif command -v yum >/dev/null 2>&1; then
+    rws_run_root yum install -y cargo rust pkgconfig openssl-devel gcc >&2
+  elif command -v pacman >/dev/null 2>&1; then
+    rws_run_root pacman -Sy --noconfirm rust pkgconf openssl base-devel >&2
+  elif command -v apk >/dev/null 2>&1; then
+    rws_run_root apk add --no-cache cargo rust pkgconf openssl-dev build-base >&2
+  elif command -v zypper >/dev/null 2>&1; then
+    rws_run_root zypper install -y cargo rust pkg-config libopenssl-devel gcc >&2
+  elif command -v brew >/dev/null 2>&1; then
+    brew install rust >&2
+  else
+    echo 'rws: shpool is missing and no supported remote package manager was found' >&2
+    exit 2
+  fi
+}
+
+rws_install_build_deps() {
+  echo 'rws: ensuring remote shpool build dependencies' >&2
+  if command -v apt-get >/dev/null 2>&1; then
+    rws_run_root apt-get update >&2
+    rws_run_root apt-get install -y pkg-config libssl-dev build-essential >&2
+  elif command -v dnf >/dev/null 2>&1; then
+    rws_run_root dnf install -y pkgconf-pkg-config openssl-devel gcc make >&2
+  elif command -v yum >/dev/null 2>&1; then
+    rws_run_root yum install -y pkgconfig openssl-devel gcc make >&2
+  elif command -v pacman >/dev/null 2>&1; then
+    rws_run_root pacman -Sy --noconfirm pkgconf openssl base-devel >&2
+  elif command -v apk >/dev/null 2>&1; then
+    rws_run_root apk add --no-cache pkgconf openssl-dev build-base >&2
+  elif command -v zypper >/dev/null 2>&1; then
+    rws_run_root zypper install -y pkg-config libopenssl-devel gcc make >&2
+  elif command -v brew >/dev/null 2>&1; then
+    brew install pkg-config openssl >&2
+  fi
+}
+
+rws_shpool_matches() {
+  [ -x \"\$1\" ] || command -v \"\$1\" >/dev/null 2>&1 || return 1
+  \"\$1\" version 2>/dev/null | grep -qx \"shpool \$rws_shpool_version\"
+}
+
+echo \"rws: checking remote shpool \$rws_shpool_version\" >&2
+if rws_shpool_matches shpool; then
+  shpool_bin=shpool
+elif [ -x \"\$HOME/.cargo/bin/shpool\" ] && rws_shpool_matches \"\$HOME/.cargo/bin/shpool\"; then
+  shpool_bin=\"\$HOME/.cargo/bin/shpool\"
+else
+  case \"\$rws_remote_install\" in
+    check)
+      echo 'rws: shpool is missing on the remote host' >&2
+      exit 2
+      ;;
+    auto)
+      rws_install_cargo
+      rws_install_build_deps
+      rws_find_cargo || {
+        echo 'rws: cargo installation completed but cargo is still not available' >&2
+        exit 2
+      }
+      echo \"rws: installing shpool \$rws_shpool_version with cargo; this may take several minutes\" >&2
+      cargo install shpool --version \"\$rws_shpool_version\" --locked
+      shpool_bin=\"\$HOME/.cargo/bin/shpool\"
+      ;;
+    *)
+      echo \"rws: invalid remote install mode: \$rws_remote_install\" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+rws_shpool_matches \"\$shpool_bin\" || {
+  echo \"rws: expected shpool \$rws_shpool_version but found: \$(\"\$shpool_bin\" version 2>/dev/null || true)\" >&2
+  exit 2
+}
+$remote_cwd_summary
+printf 'remote shpool: %s\n' \"\$shpool_bin\"
+"
+  setup_ssh_run "$remote_cmd"
+}
+
+setup_remote_prompt() {
+  [[ "$prompt_mode" == "compact" ]] || return 0
+
+  if [[ -n "${SETUP_CONTROL_PATH:-}" && "${SETUP_CONTROL_OPENED:-0}" != "1" ]]; then
+    setup_open_control_master
+  fi
+
+  local remote_cmd
+  IFS= read -r -d '' remote_cmd <<'REMOTE' || true
+set -eu
+rws_shell=${SHELL:-}
+case "$rws_shell" in
+  */zsh)
+    rws_rc="$HOME/.zshrc"
+    rws_shell_kind=zsh
+    ;;
+  */bash)
+    rws_rc="$HOME/.bashrc"
+    rws_shell_kind=bash
+    ;;
+  *)
+    echo "rws: compact prompt supports remote bash or zsh; found: ${rws_shell:-unknown}" >&2
+    exit 2
+    ;;
+esac
+
+mkdir -p "$HOME/.config/shpool"
+rws_shpool_config="$HOME/.config/shpool/config.toml"
+rws_shpool_tmp="${rws_shpool_config}.rws.$$"
+{
+  printf 'prompt_prefix = ""\n'
+  if [ -f "$rws_shpool_config" ]; then
+    awk '!/^[[:space:]]*prompt_prefix[[:space:]]*=/' "$rws_shpool_config"
+  fi
+} > "$rws_shpool_tmp"
+mv "$rws_shpool_tmp" "$rws_shpool_config"
+
+rws_tmp="${rws_rc}.rws.$$"
+if [ -f "$rws_rc" ]; then
+  sed '/^# >>> rws compact prompt >>>$/,/^# <<< rws compact prompt <<<$/d' "$rws_rc" > "$rws_tmp"
+else
+  : > "$rws_tmp"
+fi
+{
+  cat "$rws_tmp"
+  printf '\n# >>> rws compact prompt >>>\n'
+  if [ "$rws_shell_kind" = zsh ]; then
+    cat <<'RWS_ZSH'
+if [[ -n "${SHPOOL_SESSION_NAME:-}" ]]; then
+  if [[ -z "${TERM:-}" || "${TERM:-}" == "dumb" ]]; then
+    export TERM=xterm-256color
+  fi
+  PROMPT='%1~ %# '
+  RPROMPT="[${RWS_DEVICE_LABEL:-rws}:${SHPOOL_SESSION_NAME}]"
+fi
+RWS_ZSH
+  else
+    cat <<'RWS_BASH'
+if [ -n "${SHPOOL_SESSION_NAME:-}" ]; then
+  if [ -z "${TERM:-}" ] || [ "${TERM:-}" = "dumb" ]; then
+    export TERM=xterm-256color
+  fi
+  PS1='[${RWS_DEVICE_LABEL:-rws}:${SHPOOL_SESSION_NAME}] \W \$ '
+fi
+RWS_BASH
+  fi
+  printf '# <<< rws compact prompt <<<\n'
+} > "${rws_tmp}.new"
+mv "${rws_tmp}.new" "$rws_rc"
+rm -f "$rws_tmp"
+printf 'remote prompt: compact (%s, %s)\n' "$rws_shell_kind" "$rws_rc"
+REMOTE
+  setup_ssh_run "$remote_cmd"
+}
+
+cmd_doctor() {
+  check_local_openssh
+  load_selected_device
+  printf 'config=%s\n' "$CONFIG_DIR"
+  printf 'device=%s\n' "$DEVICE"
+  printf 'host=%s\n' "$HOST"
+  printf 'cwd=%s\n' "$(display_optional "$CWD")"
+  printf 'default_session=%s\n' "$(display_optional "$SESSION")"
+  printf 'shpool_bin=%s\n' "$SHPOOL_BIN"
+  printf 'prompt_mode=%s\n' "$PROMPT_MODE"
+  if [[ "$PROMPT_MODE" == "compact" ]]; then
+    printf 'prompt_label=%s\n' "$PROMPT_LABEL"
+  fi
+  cmd_check || die "remote diagnostic failed. See the classified error above"
+}
+
+setup_final_verify() {
+  if [[ "$verify_setup" != "1" ]]; then
+    setup_step 10 "Skipping device verification (--no-verify)"
+    setup_close_control_master
+    return 0
+  fi
+
+  setup_close_control_master
+
+  HOST=$init_host
+  CWD=
+  SESSION=
+  IDENTITY_FILE=$identity_file
+  SHPOOL_BIN=$shpool_bin
+  PROMPT_MODE=$prompt_mode
+  PROMPT_LABEL=$prompt_label
+  SSH_OPTIONS=()
+  if [[ ${#ssh_options[@]} -gt 0 ]]; then
+    SSH_OPTIONS=("${ssh_options[@]}")
+  fi
+
+  setup_step 10 "Verifying saved device"
+  local connect_output check_output
+  connect_output=$(ssh_plain "echo rws-connect-ok") || die "final SSH verification failed. If you skipped SSH key setup, configure key or agent authentication and rerun rws setup"
+  [[ "$connect_output" == "rws-connect-ok" ]] || die "unexpected final SSH verification output: $connect_output"
+
+  check_output=$(ssh_plain "$(remote_check_command)") || die "remote shpool verification failed"
+  printf '%s\n' "$check_output"
+  printf 'verification ok: connect, shpool\n'
+}
+
+setup_apply_runtime_device() {
+  local runtime_cwd=${1-}
+  local runtime_session=${2-}
+  HOST=$init_host
+  CWD=$runtime_cwd
+  SESSION=$runtime_session
+  IDENTITY_FILE=$identity_file
+  SHPOOL_BIN=$shpool_bin
+  PROMPT_MODE=$prompt_mode
+  PROMPT_LABEL=$prompt_label
+  SSH_OPTIONS=()
+  if [[ ${#ssh_options[@]} -gt 0 ]]; then
+    SSH_OPTIONS=("${ssh_options[@]}")
+  fi
+}
+
+setup_create_initial_session() {
+  local should_create=$create_session
+  local session_cwd=$init_cwd
+
+  if [[ "$should_create" == "auto" ]]; then
+    if [[ -t 0 && "$assume_yes" != "1" ]]; then
+      if prompt_yes_no "Create an initial session now" no; then
+        should_create=1
+      else
+        should_create=0
+      fi
+    else
+      should_create=0
+    fi
+  fi
+
+  if [[ "$should_create" != "1" ]]; then
+    setup_step 11 "Skipping initial session creation"
+    return 0
+  fi
+
+  if [[ -t 0 && "$assume_yes" != "1" && "$session_set" != "1" ]]; then
+    init_session=$(prompt_default "Initial session name" "$init_session")
+  fi
+  validate_session_name "$init_session"
+
+  setup_apply_runtime_device "" "$init_session"
+  if [[ -z "$session_cwd" ]]; then
+    if [[ -t 0 && "$assume_yes" != "1" ]]; then
+      session_cwd=$(setup_pick_remote_cwd "~")
+    else
+      die "setup --create-session requires --cwd in non-interactive mode"
+    fi
+  else
+    validate_cwd_value "$session_cwd"
+    printf 'using initial session cwd: %s\n' "$session_cwd" >&2
+  fi
+
+  setup_step 11 "Creating initial session $init_session"
+  setup_apply_runtime_device "$session_cwd" "$init_session"
+  shpool_attach "$init_session" 0 1
+  set_device_key "$init_device" default_session "$init_session"
+  printf 'created session: %s\n' "$init_session"
+  printf 'connect with: rws attach %s\n' "$init_session"
+}
+
+print_setup_remote_summary() {
+  printf '\nSetup will verify or change device state on %s:\n' "$init_host" >&2
+  printf '  device: save SSH target and remote shpool settings\n' >&2
+  if [[ "$install_key" == "1" ]]; then
+    printf '  ssh key: append the selected public key to remote ~/.ssh/authorized_keys when absent\n' >&2
+  else
+    printf '  ssh key: leave remote authorized_keys unchanged\n' >&2
+  fi
+  case "$remote_install" in
+    auto)
+      printf '  shpool: install or reuse pinned shpool %s when missing\n' "$shpool_version" >&2
+      ;;
+    check)
+      printf '  shpool: check only; do not install missing remote dependencies\n' >&2
+      ;;
+    skip)
+      printf '  shpool: skip remote dependency changes\n' >&2
+      ;;
+  esac
+  if [[ "$prompt_mode" == "compact" ]]; then
+    printf '  prompt: update managed shell rc block and shpool prompt_prefix for compact prompt\n' >&2
+  else
+    printf '  prompt: leave remote shell prompt unchanged\n' >&2
+  fi
+  if [[ "$create_session" == "1" ]]; then
+    printf '  session: create %s in %s after device verification; do not auto-attach\n' "$init_session" "$init_cwd" >&2
+  elif [[ "$create_session" == "0" ]]; then
+    printf '  session: skip initial session creation\n' >&2
+  else
+    printf '  session: ask after device verification\n' >&2
+  fi
+  printf '\n' >&2
+}
+
+setup_step() {
+  local step=$1
+  shift
+  printf '[%s/%s] %s\n' "$step" "$RWS_SETUP_STEP_TOTAL" "$*"
+}
+
+setup_remote_progress_interval() {
+  local interval=${RWS_SETUP_PROGRESS_INTERVAL:-20}
+  case "$interval" in
+    ''|*[!0-9]*)
+      interval=20
+      ;;
+  esac
+  printf '%s\n' "$interval"
+}
+
+setup_remote_prereqs_with_progress() {
+  local output_file=$1
+  local heartbeat_interval heartbeat_pid='' elapsed=0
+  heartbeat_interval=$(setup_remote_progress_interval)
+  if (( heartbeat_interval > 0 )); then
+    (
+      elapsed=$heartbeat_interval
+      while sleep "$heartbeat_interval"; do
+        printf 'rws: still preparing remote dependencies on %s (%ss elapsed); first setup can take several minutes\n' "$init_host" "$elapsed" >&2
+        elapsed=$((elapsed + heartbeat_interval))
+      done
+    ) &
+    heartbeat_pid=$!
+  fi
+
+  set +e
+  setup_remote_prereqs 2>&1 | tee "$output_file"
+  local status=${PIPESTATUS[0]}
+  set -e
+
+  if [[ -n "$heartbeat_pid" ]]; then
+    kill "$heartbeat_pid" >/dev/null 2>&1 || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+  fi
+  return "$status"
+}
+
+cmd_setup() {
+  local init_device=$DEVICE
+  local init_host=
+  local init_cwd=
+  local init_session=work
+  local key_mode=ask
+  local identity_file=
+  local install_key=auto
+  local bootstrap_identity=
+  local force_key=0
+  local remote_install=auto
+  local remote_install_explicit=0
+  local shpool_version=$DEFAULT_SHPOOL_VERSION
+  local shpool_bin=shpool
+  local assume_yes=0
+  local verify_setup=1
+  local create_session=auto
+  local prompt_mode=auto
+  local prompt_label=
+  local ssh_options=()
+  local host_set=0
+  local cwd_set=0
+  local session_set=0
+  local identity_file_set=0
+  local shpool_bin_set=0
+  local prompt_mode_set=0
+  local prompt_label_set=0
+  local ssh_options_set=0
+  local setup_interactive=0
+  local local_ssh_checked=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage_setup
+        return 0
+        ;;
+      -d|--device)
+        [[ $# -ge 2 ]] || die "--device requires a value"
+        init_device=$2
+        shift 2
+        ;;
+      -H|--host)
+        [[ $# -ge 2 ]] || die "--host requires a value"
+        init_host=$2
+        host_set=1
+        shift 2
+        ;;
+      -C|--cwd)
+        [[ $# -ge 2 ]] || die "--cwd requires a value"
+        init_cwd=$2
+        cwd_set=1
+        shift 2
+        ;;
+      -s|--session)
+        [[ $# -ge 2 ]] || die "--session requires a value"
+        init_session=$2
+        session_set=1
+        shift 2
+        ;;
+      -S|--create-session)
+        create_session=1
+        shift
+        ;;
+      -x|--no-create-session)
+        create_session=0
+        shift
+        ;;
+      -k|--key-mode)
+        [[ $# -ge 2 ]] || die "--key-mode requires a value"
+        key_mode=$2
+        shift 2
+        ;;
+      -i|--identity-file)
+        [[ $# -ge 2 ]] || die "--identity-file requires a value"
+        identity_file=$2
+        identity_file_set=1
+        shift 2
+        ;;
+      -K|--install-key)
+        install_key=1
+        shift
+        ;;
+      -N|--no-install-key)
+        install_key=0
+        shift
+        ;;
+      -b|--bootstrap-identity)
+        [[ $# -ge 2 ]] || die "--bootstrap-identity requires a value"
+        bootstrap_identity=$2
+        shift 2
+        ;;
+      -F|--force-key)
+        force_key=1
+        shift
+        ;;
+      -r|--remote-install)
+        [[ $# -ge 2 ]] || die "--remote-install requires a value"
+        remote_install=$2
+        remote_install_explicit=1
+        shift 2
+        ;;
+      --shpool-version)
+        [[ $# -ge 2 ]] || die "--shpool-version requires a value"
+        shpool_version=$2
+        shift 2
+        ;;
+      -B|--shpool-bin)
+        [[ $# -ge 2 ]] || die "--shpool-bin requires a value"
+        shpool_bin=$2
+        shpool_bin_set=1
+        shift 2
+        ;;
+      -m|--prompt-mode)
+        [[ $# -ge 2 ]] || die "--prompt-mode requires a value"
+        prompt_mode=$2
+        prompt_mode_set=1
+        shift 2
+        ;;
+      -l|--prompt-label)
+        [[ $# -ge 2 ]] || die "--prompt-label requires a value"
+        prompt_label=$2
+        prompt_label_set=1
+        shift 2
+        ;;
+      -o|--ssh-option)
+        [[ $# -ge 2 ]] || die "--ssh-option requires a value"
+        ssh_options+=("$2")
+        ssh_options_set=1
+        shift 2
+        ;;
+      --verify)
+        verify_setup=1
+        shift
+        ;;
+      -n|--no-verify)
+        verify_setup=0
+        shift
+        ;;
+      -y|--yes)
+        assume_yes=1
+        shift
+        ;;
+      *)
+        die "unknown setup option: $1"
+        ;;
+    esac
+  done
+
+  case "$remote_install" in
+    auto|check|skip)
+      ;;
+    *)
+      die "--remote-install must be auto, check, or skip"
+      ;;
+  esac
+  case "$prompt_mode" in
+    auto|compact|skip)
+      ;;
+    *)
+      die "--prompt-mode must be compact or skip"
+      ;;
+  esac
+  if [[ -n "$prompt_label" && "$prompt_mode" == "auto" ]]; then
+    prompt_mode=compact
+  fi
+  if [[ -n "$prompt_label" && "$prompt_mode" == "skip" ]]; then
+    die "--prompt-label requires --prompt-mode compact"
+  fi
+
+  local config_dir=
+  local device_file=
+
+  if [[ -t 0 && "$assume_yes" != "1" ]]; then
+    setup_interactive=1
+    printf 'Remote Work Sessions setup\n' >&2
+    setup_step 1 "Collecting device and SSH target"
+    init_device=$(prompt_default "Device name" "$init_device")
+    validate_device_name "$init_device"
+    config_dir=$(write_config_dir)
+    device_file="$config_dir/devices/$init_device.conf"
+    if [[ -f "$device_file" ]]; then
+      local existing_action
+      existing_action=$(prompt_existing_device_action "$init_device" "$device_file")
+      if [[ "$existing_action" == "continue" ]]; then
+        local saved_DEVICE=$DEVICE
+        local saved_HOST=$HOST
+        local saved_CWD=$CWD
+        local saved_SESSION=$SESSION
+        local saved_IDENTITY_FILE=$IDENTITY_FILE
+        local saved_SHPOOL_BIN=$SHPOOL_BIN
+        local saved_PROMPT_MODE=$PROMPT_MODE
+        local saved_PROMPT_LABEL=$PROMPT_LABEL
+        local saved_CONFIG_SETUP_VERSION=$CONFIG_SETUP_VERSION
+        local saved_CONFIG_SHPOOL_VERSION=$CONFIG_SHPOOL_VERSION
+        local saved_ssh_options=("${SSH_OPTIONS[@]}")
+        DEVICE=
+        HOST=
+        CWD=
+        SESSION=
+        IDENTITY_FILE=
+        SHPOOL_BIN=shpool
+        PROMPT_MODE=skip
+        PROMPT_LABEL=
+        CONFIG_SETUP_VERSION=
+        CONFIG_SHPOOL_VERSION=
+        SSH_OPTIONS=()
+        load_config "$device_file"
+        [[ "$host_set" != "1" && -n "$HOST" ]] && init_host=$HOST
+        [[ "$cwd_set" != "1" && -n "$CWD" ]] && init_cwd=$CWD
+        [[ "$session_set" != "1" && -n "$SESSION" ]] && init_session=$SESSION
+        [[ "$identity_file_set" != "1" && -n "$IDENTITY_FILE" ]] && identity_file=$IDENTITY_FILE
+        [[ "$shpool_bin_set" != "1" && -n "$SHPOOL_BIN" ]] && shpool_bin=$SHPOOL_BIN
+        [[ "$prompt_mode_set" != "1" && -n "$PROMPT_MODE" ]] && prompt_mode=$PROMPT_MODE
+        [[ "$prompt_label_set" != "1" && -n "$PROMPT_LABEL" ]] && prompt_label=$PROMPT_LABEL
+        if [[ "$ssh_options_set" != "1" && ${#SSH_OPTIONS[@]} -gt 0 ]]; then
+          ssh_options=("${SSH_OPTIONS[@]}")
+        fi
+        DEVICE=$saved_DEVICE
+        HOST=$saved_HOST
+        CWD=$saved_CWD
+        SESSION=$saved_SESSION
+        IDENTITY_FILE=$saved_IDENTITY_FILE
+        SHPOOL_BIN=$saved_SHPOOL_BIN
+        PROMPT_MODE=$saved_PROMPT_MODE
+        PROMPT_LABEL=$saved_PROMPT_LABEL
+        CONFIG_SETUP_VERSION=$saved_CONFIG_SETUP_VERSION
+        CONFIG_SHPOOL_VERSION=$saved_CONFIG_SHPOOL_VERSION
+        SSH_OPTIONS=("${saved_ssh_options[@]}")
+      else
+        printf 'Resetting device config: %s\n' "$init_device" >&2
+      fi
+    fi
+    if [[ -z "$init_host" ]]; then
+      init_host=$(prompt_ssh_host "")
+    else
+      init_host=$(prompt_ssh_host "$init_host")
+    fi
+
+    setup_step 2 "Checking local SSH tooling"
+    install_local_openssh
+    local_ssh_checked=1
+    setup_prepare_control_master
+    setup_step 3 "Opening first SSH connection"
+    setup_open_control_master
+    setup_step 4 "Collecting device prompt settings"
+    if [[ "$prompt_mode" == "auto" ]]; then
+      if prompt_yes_no "Use compact prompt for remote sessions" yes; then
+        prompt_mode=compact
+        prompt_label=$(prompt_default "Prompt device label" "$init_device")
+      else
+        prompt_mode=skip
+      fi
+    elif [[ "$prompt_mode" == "compact" && -z "$prompt_label" ]]; then
+      prompt_label=$(prompt_default "Prompt device label" "$init_device")
+    fi
+    setup_step 5 "Collecting SSH key settings"
+    if [[ "$key_mode" == "ask" ]]; then
+      if prompt_yes_no "Use SSH key authentication for stable reconnects" yes; then
+        printf 'SSH key setup:\n' >&2
+        printf '  1) create a dedicated key\n' >&2
+        printf '  2) use an existing key\n' >&2
+        printf 'Choose [1/2] [1]: ' >&2
+        local choice
+        read -r choice || setup_cancel
+        if prompt_cancel_requested "$choice"; then
+          setup_cancel
+        fi
+        case "$choice" in
+          2)
+            key_mode=existing
+            ;;
+          1|'')
+            key_mode=create
+            ;;
+          *)
+            die "invalid SSH key setup choice: $choice"
+            ;;
+        esac
+        install_key=1
+      else
+        key_mode=skip
+        install_key=0
+        printf 'Skipping SSH key setup. Daily commands require another non-interactive SSH auth method, such as an agent or existing SSH config.\n' >&2
+      fi
+    fi
+  fi
+
+  if [[ "$setup_interactive" != "1" ]]; then
+    setup_step 1 "Reading setup options"
+  fi
+  [[ -n "$init_host" ]] || die "setup requires --host in non-interactive mode"
+  if [[ "$create_session" == "auto" && "$setup_interactive" != "1" ]]; then
+    if [[ "$cwd_set" == "1" || "$session_set" == "1" ]]; then
+      create_session=1
+    else
+      create_session=0
+    fi
+  fi
+  if [[ "$create_session" == "1" && "$setup_interactive" != "1" && -z "$init_cwd" ]]; then
+    die "setup --create-session requires --cwd in non-interactive mode"
+  fi
+  validate_device_name "$init_device"
+  if [[ -n "$init_session" ]]; then
+    validate_session_name "$init_session"
+  fi
+  if [[ -n "$init_cwd" ]]; then
+    validate_cwd_value "$init_cwd"
+  fi
+  if [[ "$prompt_mode" == "auto" ]]; then
+    prompt_mode=skip
+  fi
+  validate_prompt_mode "$prompt_mode"
+  if [[ "$prompt_mode" == "compact" && -z "$prompt_label" ]]; then
+    prompt_label=$init_device
+  fi
+  if [[ -n "$prompt_label" ]]; then
+    validate_prompt_label "$prompt_label"
+  fi
+
+  if [[ "$key_mode" == "ask" ]]; then
+    key_mode=create
+  fi
+  case "$key_mode" in
+    create|existing|skip)
+      ;;
+    *)
+      die "--key-mode must be create, existing, or skip"
+      ;;
+  esac
+  if [[ "$key_mode" == "existing" && -z "$identity_file" && -t 0 && "$assume_yes" != "1" ]]; then
+    identity_file=$(prompt_default "Existing SSH identity file" "$(default_existing_identity_file)")
+  fi
+  if [[ "$install_key" == "auto" ]]; then
+    if [[ "$key_mode" == "create" ]]; then
+      install_key=1
+    else
+      install_key=0
+    fi
+  fi
+  if [[ "$key_mode" == "existing" && -z "$identity_file" ]]; then
+    die "--key-mode existing requires --identity-file"
+  fi
+  if [[ "$key_mode" == "create" && -z "$identity_file" ]]; then
+    identity_file="~/.ssh/rws_${init_device}_ed25519"
+  fi
+  if [[ "$setup_interactive" != "1" ]]; then
+    setup_step 2 "Checking local SSH tooling"
+    setup_step 3 "Using supplied SSH target"
+    setup_step 4 "Applying device prompt settings"
+    setup_step 5 "Applying SSH key settings"
+  fi
+
+  setup_step 6 "Reviewing device changes"
+  if [[ -t 0 && "$assume_yes" != "1" ]]; then
+    print_setup_remote_summary
+    if [[ "$remote_install" == "auto" && "$remote_install_explicit" != "1" ]]; then
+      printf 'Remote dependency auto-install may install Rust/Cargo and shpool. First setup can take several minutes.\n' >&2
+      if ! prompt_yes_no "Install missing remote dependencies automatically if needed" yes; then
+        remote_install=check
+        printf 'Remote auto-install disabled. Setup will check dependencies and report anything missing.\n' >&2
+      fi
+    fi
+  fi
+
+  if [[ "$local_ssh_checked" != "1" ]]; then
+    install_local_openssh
+    local_ssh_checked=1
+  fi
+
+  if [[ -z "$config_dir" ]]; then
+    config_dir=$(write_config_dir)
+  fi
+  if [[ -z "$device_file" ]]; then
+    device_file="$config_dir/devices/$init_device.conf"
+  fi
+  setup_step 7 "Writing local config and SSH key setup"
+  if [[ ! -f "$device_file" ]]; then
+    printf 'New device detected: %s\n' "$init_device"
+  fi
+  if [[ -t 0 && "$assume_yes" != "1" && -z "$bootstrap_identity" ]]; then
+    setup_prepare_control_master
+  fi
+
+  local init_args=(
+    --device "$init_device"
+    --host "$init_host"
+    --key-mode "$key_mode"
+    --shpool-bin "$shpool_bin"
+    --setup-version "$RWS_VERSION"
+    --shpool-version "$shpool_version"
+    --prompt-mode "$prompt_mode"
+  )
+  if [[ -n "$prompt_label" ]]; then
+    init_args+=(--prompt-label "$prompt_label")
+  fi
+  if [[ -n "$identity_file" ]]; then
+    init_args+=(--identity-file "$identity_file")
+  fi
+  if [[ "$install_key" == "1" ]]; then
+    init_args+=(--install-key)
+  fi
+  if [[ -n "$bootstrap_identity" ]]; then
+    init_args+=(--bootstrap-identity "$bootstrap_identity")
+  fi
+  if [[ "$force_key" == "1" ]]; then
+    init_args+=(--force-key)
+  fi
+  local option
+  if [[ ${#ssh_options[@]} -gt 0 ]]; then
+    for option in "${ssh_options[@]}"; do
+      init_args+=(--ssh-option "$option")
+    done
+  fi
+
+  cmd_init "${init_args[@]}"
+  local remote_output remote_output_file remote_status remote_shpool_bin
+  if [[ "$remote_install" == "skip" ]]; then
+    setup_step 8 "Skipping remote dependency setup (--remote-install skip)"
+  else
+    if [[ "$remote_install" == "check" ]]; then
+      setup_step 8 "Checking remote dependencies on $init_host"
+    else
+      setup_step 8 "Preparing remote dependencies on $init_host; this may take several minutes on first setup"
+    fi
+  fi
+  remote_output_file=$(mktemp "${TMPDIR:-/tmp}/rws-remote-setup.XXXXXX")
+  if setup_remote_prereqs_with_progress "$remote_output_file"; then
+    remote_status=0
+  else
+    remote_status=$?
+  fi
+  remote_output=$(tr -d '\r' < "$remote_output_file")
+  rm -f "$remote_output_file"
+  if [[ "$remote_status" != "0" ]]; then
+    setup_close_control_master
+    die "remote dependency setup failed. Partial device config may exist at $device_file; fix the remote dependency issue and rerun rws setup"
+  fi
+  if [[ -n "$remote_output" ]]; then
+    remote_shpool_bin=$(printf '%s\n' "$remote_output" | sed -n 's/^remote shpool: //p' | tail -n 1)
+    if [[ -n "$remote_shpool_bin" && "$remote_shpool_bin" != "$shpool_bin" ]]; then
+      set_device_key "$init_device" shpool_bin "$remote_shpool_bin"
+      shpool_bin=$remote_shpool_bin
+      printf 'updated %s to use remote shpool: %s\n' "$device_file" "$remote_shpool_bin"
+    fi
+  fi
+
+  local prompt_output
+  if [[ "$prompt_mode" == "compact" ]]; then
+    setup_step 9 "Configuring compact prompt on $init_host"
+  else
+    setup_step 9 "Skipping compact prompt setup"
+  fi
+  if ! prompt_output=$(setup_remote_prompt); then
+    setup_close_control_master
+    die "remote prompt setup failed. Rerun with --prompt-mode skip to leave the remote shell prompt unchanged"
+  fi
+  prompt_output=${prompt_output//$'\r'/}
+  if [[ -n "$prompt_output" ]]; then
+    printf '%s\n' "$prompt_output"
+  fi
+
+  setup_final_verify
+  setup_create_initial_session
+
+  setup_step 12 "Setup complete"
+  printf '\nSetup complete.\n'
+  printf 'Typical commands:\n'
+  printf '  rws attach <session>\n'
+  printf '  rws new review --pick-cwd\n'
+  printf '  rws f\n'
+  printf '  rws s\n'
+  printf '  rws --cwd <dir> run -- git status --short\n'
+  printf 'Full docs: %s\n' "$RWS_DOCS_URL"
+}
+
+cmd_init() {
+  local init_device=$DEVICE
+  local init_host=
+  local init_cwd=
+  local init_session=
+  local key_mode=ask
+  local identity_file=
+  local init_shpool_bin=shpool
+  local init_setup_version=
+  local init_shpool_version=
+  local init_prompt_mode=skip
+  local init_prompt_label=
+  local install_key=0
+  local bootstrap_identity=
+  local force_key=0
+  local ssh_options=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--device)
+        [[ $# -ge 2 ]] || die "--device requires a value"
+        init_device=$2
+        shift 2
+        ;;
+      -H|--host)
+        [[ $# -ge 2 ]] || die "--host requires a value"
+        init_host=$2
+        shift 2
+        ;;
+      -C|--cwd)
+        [[ $# -ge 2 ]] || die "--cwd requires a value"
+        init_cwd=$2
+        shift 2
+        ;;
+      -s|--session)
+        [[ $# -ge 2 ]] || die "--session requires a value"
+        init_session=$2
+        shift 2
+        ;;
+      -k|--key-mode)
+        [[ $# -ge 2 ]] || die "--key-mode requires a value"
+        key_mode=$2
+        shift 2
+        ;;
+      -i|--identity-file)
+        [[ $# -ge 2 ]] || die "--identity-file requires a value"
+        identity_file=$2
+        shift 2
+        ;;
+      -B|--shpool-bin)
+        [[ $# -ge 2 ]] || die "--shpool-bin requires a value"
+        init_shpool_bin=$2
+        shift 2
+        ;;
+      --setup-version)
+        [[ $# -ge 2 ]] || die "--setup-version requires a value"
+        init_setup_version=$2
+        shift 2
+        ;;
+      --shpool-version)
+        [[ $# -ge 2 ]] || die "--shpool-version requires a value"
+        init_shpool_version=$2
+        shift 2
+        ;;
+      -m|--prompt-mode)
+        [[ $# -ge 2 ]] || die "--prompt-mode requires a value"
+        init_prompt_mode=$2
+        shift 2
+        ;;
+      -l|--prompt-label)
+        [[ $# -ge 2 ]] || die "--prompt-label requires a value"
+        init_prompt_label=$2
+        shift 2
+        ;;
+      -K|--install-key)
+        install_key=1
+        shift
+        ;;
+      -b|--bootstrap-identity)
+        [[ $# -ge 2 ]] || die "--bootstrap-identity requires a value"
+        bootstrap_identity=$2
+        shift 2
+        ;;
+      -F|--force-key)
+        force_key=1
+        shift
+        ;;
+      -o|--ssh-option)
+        [[ $# -ge 2 ]] || die "--ssh-option requires a value"
+        ssh_options+=("$2")
+        shift 2
+        ;;
+      *)
+        die "unknown init option: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$init_host" ]] || die "init requires --host"
+  validate_device_name "$init_device"
+  if [[ -n "$init_session" ]]; then
+    validate_session_name "$init_session"
+  fi
+  if [[ -n "$init_cwd" ]]; then
+    validate_cwd_value "$init_cwd"
+  fi
+  validate_prompt_mode "$init_prompt_mode"
+  if [[ "$init_prompt_mode" == "compact" && -z "$init_prompt_label" ]]; then
+    init_prompt_label=$init_device
+  fi
+  if [[ -n "$init_prompt_label" ]]; then
+    validate_prompt_label "$init_prompt_label"
+  fi
+  if [[ "$init_prompt_mode" == "skip" && -n "$init_prompt_label" ]]; then
+    die "--prompt-label requires --prompt-mode compact"
+  fi
+
+  case "$key_mode" in
+    ask|create|existing|skip)
+      ;;
+    *)
+      die "--key-mode must be create, existing, or skip"
+      ;;
+  esac
+
+  if [[ "$key_mode" == "ask" ]]; then
+    if [[ -t 0 ]]; then
+      printf 'SSH key setup:\n'
+      printf '  1) use an existing key\n'
+      printf '  2) create a new key\n'
+      printf '  3) skip SSH key setup\n'
+      printf 'Choose [1/2/3]: '
+      local choice
+      read -r choice
+      case "$choice" in
+        1)
+          key_mode=existing
+          ;;
+        2)
+          key_mode=create
+          ;;
+        3|'')
+          key_mode=skip
+          ;;
+        *)
+          die "invalid SSH key setup choice: $choice"
+          ;;
+      esac
+    else
+      key_mode=skip
+    fi
+  fi
+
+  if [[ "$key_mode" == "existing" && -z "$identity_file" && -t 0 ]]; then
+    identity_file=$(prompt_default "Existing SSH identity file" "$(default_existing_identity_file)")
+  fi
+  if [[ "$key_mode" == "existing" && -z "$identity_file" ]]; then
+    die "--key-mode existing requires --identity-file"
+  fi
+  if [[ "$key_mode" == "create" && -z "$identity_file" ]]; then
+    identity_file="~/.ssh/rws_${init_device}_ed25519"
+  fi
+
+  if [[ "$key_mode" == "create" ]]; then
+    local key_path
+    key_path=$(local_path "$identity_file")
+    mkdir -p "$(dirname "$key_path")"
+    if [[ -e "$key_path" && "$force_key" != "1" ]]; then
+      printf 'using existing identity file: %s\n' "$key_path" >&2
+      if [[ ! -f "$key_path.pub" ]]; then
+        ssh-keygen -y -f "$key_path" > "$key_path.pub"
+      fi
+      chmod 600 "$key_path"
+      chmod 644 "$key_path.pub"
+    else
+      if [[ "$force_key" == "1" ]]; then
+        rm -f "$key_path" "$key_path.pub"
+      fi
+      ssh-keygen -t ed25519 -N '' -C "rws:${init_device}" -f "$key_path" >/dev/null
+      chmod 600 "$key_path"
+      chmod 644 "$key_path.pub"
+    fi
+  elif [[ "$key_mode" == "existing" ]]; then
+    [[ -f "$(local_path "$identity_file")" ]] || die "identity file not found: $identity_file"
+    if [[ ! -f "$(local_path "$identity_file").pub" ]]; then
+      ssh-keygen -y -f "$(local_path "$identity_file")" > "$(local_path "$identity_file").pub"
+    fi
+  fi
+
+  if [[ "$install_key" == "1" ]]; then
+    [[ -n "$identity_file" ]] || die "--install-key requires --identity-file or a non-skip --key-mode"
+    local key_path pub_key bootstrap_path remote_cmd
+    key_path=$(local_path "$identity_file")
+    [[ -f "$key_path.pub" ]] || die "public key not found: $key_path.pub"
+    pub_key=$(cat "$key_path.pub")
+    remote_cmd="mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && grep -qxF $(sq "$pub_key") ~/.ssh/authorized_keys || printf '%s\n' $(sq "$pub_key") >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys"
+
+    local install_args=()
+    local option
+    if [[ ${#ssh_options[@]} -gt 0 ]]; then
+      for option in "${ssh_options[@]}"; do
+        install_args+=(-o "$option")
+      done
+    fi
+    if [[ -n "$bootstrap_identity" ]]; then
+      bootstrap_path=$(local_path "$bootstrap_identity")
+      [[ -f "$bootstrap_path" ]] || die "bootstrap identity not found: $bootstrap_identity"
+      install_args+=(-i "$bootstrap_path")
+      if ! ssh -o BatchMode=yes "${install_args[@]}" "$init_host" "$remote_cmd"; then
+        die "SSH key installation failed through bootstrap identity. Check remote permissions and authorized_keys access"
+      fi
+    else
+      [[ -t 0 ]] || die "--install-key without --bootstrap-identity requires an interactive terminal for SSH password or host-key prompts"
+      if [[ -n "${SETUP_CONTROL_PATH:-}" ]]; then
+        setup_open_control_master
+        install_args+=(-S "$SETUP_CONTROL_PATH" -o ControlMaster=no)
+        printf 'Installing public key through the established SSH connection.\n' >&2
+      else
+        printf 'Installing public key through interactive SSH. Enter the remote SSH password if prompted.\n' >&2
+      fi
+      if [[ ${#install_args[@]} -gt 0 ]]; then
+        if ! ssh "${install_args[@]}" "$init_host" "$remote_cmd"; then
+          die "SSH key installation failed. Check remote permissions for ~/.ssh/authorized_keys"
+        fi
+      else
+        if ! ssh "$init_host" "$remote_cmd"; then
+          die "SSH key installation failed. Check remote permissions for ~/.ssh/authorized_keys"
+        fi
+      fi
+    fi
+  fi
+
+  local config_dir
+  config_dir=$(write_config_dir)
+  mkdir -p "$config_dir/devices"
+  {
+    printf '# Default device for rws.\n'
+    printf 'device=%s\n' "$init_device"
+  } > "$config_dir/default.conf"
+  {
+    printf '# Remote Work Sessions device.\n'
+    printf 'host=%s\n' "$init_host"
+    if [[ -n "$init_cwd" ]]; then
+      printf 'cwd=%s\n' "$init_cwd"
+    fi
+    if [[ -n "$init_session" ]]; then
+      printf 'default_session=%s\n' "$init_session"
+    fi
+    printf 'shpool_bin=%s\n' "$init_shpool_bin"
+    printf 'prompt_mode=%s\n' "$init_prompt_mode"
+    if [[ -n "$init_prompt_label" ]]; then
+      printf 'prompt_label=%s\n' "$init_prompt_label"
+    fi
+    if [[ -n "$init_setup_version" ]]; then
+      printf 'setup_version=%s\n' "$init_setup_version"
+    fi
+    if [[ -n "$init_shpool_version" ]]; then
+      printf 'shpool_version=%s\n' "$init_shpool_version"
+    fi
+    if [[ -n "$identity_file" ]]; then
+      printf 'identity_file=%s\n' "$identity_file"
+    fi
+    local option
+    if [[ ${#ssh_options[@]} -gt 0 ]]; then
+      for option in "${ssh_options[@]}"; do
+        printf 'ssh_option=%s\n' "$option"
+      done
+    fi
+  } > "$config_dir/devices/$init_device.conf"
+
+  printf 'created %s\n' "$config_dir/default.conf"
+  printf 'created %s\n' "$config_dir/devices/$init_device.conf"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config-dir)
+      [[ $# -ge 2 ]] || die "--config-dir requires a value"
+      CONFIG_DIR=$2
+      shift 2
+      ;;
+    -d|--device)
+      [[ $# -ge 2 ]] || die "--device requires a value"
+      DEVICE=$2
+      DEVICE_OVERRIDE=$2
+      shift 2
+      ;;
+    -H|--host)
+      [[ $# -ge 2 ]] || die "--host requires a value"
+      HOST_OVERRIDE=$2
+      shift 2
+      ;;
+    -C|--cwd)
+      [[ $# -ge 2 ]] || die "--cwd requires a value"
+      CWD_OVERRIDE=$2
+      shift 2
+      ;;
+    -s|--session)
+      [[ $# -ge 2 ]] || die "--session requires a value"
+      SESSION_OVERRIDE=$2
+      shift 2
+      ;;
+    -i|--identity-file)
+      [[ $# -ge 2 ]] || die "--identity-file requires a value"
+      IDENTITY_FILE_OVERRIDE=$2
+      shift 2
+      ;;
+    -B|--shpool-bin)
+      [[ $# -ge 2 ]] || die "--shpool-bin requires a value"
+      SHPOOL_BIN_OVERRIDE=$2
+      shift 2
+      ;;
+    -o|--ssh-option)
+      [[ $# -ge 2 ]] || die "--ssh-option requires a value"
+      SSH_OPTION_OVERRIDES+=("$2")
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -V|--version)
+      printf 'rws %s\n' "$RWS_VERSION"
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+COMMAND=${1:-attach}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+RWS_USAGE_CONTEXT=$(command_usage_context "$COMMAND")
+
+if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+  usage_for_context "$RWS_USAGE_CONTEXT"
+  exit 0
+fi
+case "$COMMAND" in
+  key|device|session)
+    if [[ "${2-}" == "-h" || "${2-}" == "--help" ]]; then
+      usage_for_context "$RWS_USAGE_CONTEXT"
+      exit 0
+    fi
+    ;;
+esac
+
+case "$COMMAND" in
+  setup)
+    cmd_setup "$@"
+    exit 0
+    ;;
+  init)
+    cmd_init "$@"
+    exit 0
+    ;;
+  doctor)
+    [[ $# -eq 0 ]] || die "doctor accepts no arguments"
+    cmd_doctor "$@"
+    exit 0
+    ;;
+  key)
+    cmd_key "$@"
+    exit 0
+    ;;
+  devices)
+    if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+      usage_device
+      exit 0
+    fi
+    [[ $# -eq 0 ]] || die "devices accepts no arguments"
+    cmd_devices
+    exit 0
+    ;;
+  remove|rm)
+    cmd_remove_device "$@"
+    exit 0
+    ;;
+  device)
+    case "${1-}" in
+      -h|--help|help)
+        usage_device
+        exit 0
+        ;;
+      create|add)
+        shift
+        cmd_device_create "$@"
+        exit 0
+        ;;
+      get|show|read)
+        shift
+        cmd_device_get "$@"
+        exit 0
+        ;;
+      update)
+        shift
+        if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+          usage_device
+          exit 0
+        fi
+        cmd_device_update "$@"
+        exit 0
+        ;;
+      remove|rm)
+        shift
+        cmd_remove_device "$@"
+        exit 0
+        ;;
+      list|ls|'')
+        shift || true
+        cmd_devices "$@"
+        exit 0
+        ;;
+      *)
+        die "unknown device command: $1"
+        ;;
+    esac
+    ;;
+  session)
+    if [[ "${1-}" == "-h" || "${1-}" == "--help" || "${1-}" == "help" ]]; then
+      usage_session
+      exit 0
+    fi
+    ;;
+  new|n)
+    cmd_new "$@"
+    exit 0
+    ;;
+  run)
+    cmd_run "$@"
+    exit 0
+    ;;
+  help)
+    cmd_help "$@"
+    exit 0
+    ;;
+esac
+
+case "$COMMAND" in
+  a|attach)
+    [[ $# -le 1 ]] || die "attach accepts at most one SESSION"
+    ;;
+  f|force)
+    [[ $# -le 1 ]] || die "force accepts at most one SESSION"
+    ;;
+  bg|background)
+    [[ $# -le 1 ]] || die "background accepts at most one SESSION"
+    ;;
+  c|check)
+    [[ $# -eq 0 ]] || die "check accepts no arguments"
+    ;;
+  s|status)
+    [[ $# -eq 0 ]] || die "status accepts no arguments"
+    ;;
+  sh|shell)
+    [[ $# -eq 0 ]] || die "shell accepts no arguments"
+    ;;
+  sessions|ls|list)
+    if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "-j" && "$1" != "--json" ) ]]; then
+      die "sessions accepts only --json or -j"
+    fi
+    ;;
+esac
+
+load_selected_device
+
+case "$COMMAND" in
+  a|attach)
+    explicit=0
+    if [[ $# -gt 0 ]]; then
+      SESSION=$1
+      explicit=1
+      shift
+      [[ $# -eq 0 ]] || die "attach accepts at most one SESSION"
+    fi
+    require_session "attach"
+    if coding_session_exists "$SESSION"; then
+      attach_coding_session "$SESSION" 0
+      exit 0
+    fi
+    if [[ "$explicit" == "1" || -z "$CWD" ]]; then
+      ensure_session_exists "$SESSION"
+    fi
+    shpool_attach "$SESSION" 0 0
+    ;;
+  f|force)
+    if [[ $# -gt 0 ]]; then
+      SESSION=$1
+      shift
+      [[ $# -eq 0 ]] || die "force accepts at most one SESSION"
+    fi
+    require_session "force"
+    if coding_session_exists "$SESSION"; then
+      attach_coding_session "$SESSION" 1
+      exit 0
+    fi
+    if [[ -z "$CWD" ]]; then
+      ensure_session_exists "$SESSION"
+    fi
+    shpool_attach "$SESSION" 1 0
+    ;;
+  bg|background)
+    if [[ $# -gt 0 ]]; then
+      SESSION=$1
+      shift
+      [[ $# -eq 0 ]] || die "background accepts at most one SESSION"
+    fi
+    require_session "background"
+    if coding_session_exists "$SESSION"; then
+      sessions=$(fetch_sessions_json) || exit
+      if ! session_exists_in_json "$sessions" "$SESSION"; then
+        die "session with agent metadata must be resumed interactively: rws attach $SESSION"
+      fi
+      shpool_attach "$SESSION" 0 1
+    elif [[ -z "$CWD" ]]; then
+      die "background requires a cwd. Pass --cwd DIR or create the session with rws new $SESSION --pick-cwd"
+    else
+      shpool_attach "$SESSION" 0 1
+    fi
+    ;;
+  c|check)
+    [[ $# -eq 0 ]] || die "check accepts no arguments"
+    cmd_check
+    ;;
+  s|status)
+    [[ $# -eq 0 ]] || die "status accepts no arguments"
+    cmd_status
+    ;;
+  sh|shell)
+    [[ $# -eq 0 ]] || die "shell accepts no arguments"
+    require_cwd "shell"
+    ssh_tty "cd $(remote_path "$CWD") && exec \${SHELL:-/bin/sh} -l"
+    ;;
+  sessions|ls|list)
+    cmd_list "$@"
+    ;;
+  session)
+    cmd_session "$@"
+    ;;
+  d|detach)
+    cmd_detach "$@"
+    ;;
+  k|kill)
+    if [[ $# -gt 0 ]]; then
+      cmd_session_delete "$@"
+    else
+      require_session "kill"
+      cmd_session_delete "$SESSION"
+    fi
+    ;;
+  *)
+    die "unknown command: $COMMAND"
+    ;;
+esac

@@ -1,0 +1,2 @@
+# rws intentionally preserves quoted ~/ paths as remote/config literals.
+disable=SC2088

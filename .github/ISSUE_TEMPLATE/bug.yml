@@ -1,0 +1,61 @@
+name: Bug report
+description: Report reproducible incorrect behavior.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Remove credentials, private hosts and addresses, usernames, device names, and absolute home paths before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: rws version
+      description: Output of `rws --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: local-os
+    attributes:
+      label: Local operating system
+      options:
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: remote-os
+    attributes:
+      label: Remote operating system
+      placeholder: Generic distribution and version only
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use reserved example hosts and generic paths.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include sanitized `rws doctor` output when relevant.
+    validations:
+      required: true
+  - type: checkboxes
+    id: sensitive-data
+    attributes:
+      label: Sensitive-data check
+      options:
+        - label: I removed credentials and environment-specific identifiers from this report.
+          required: true
+        - label: This is not a security vulnerability; security findings use private vulnerability reporting.
+          required: true

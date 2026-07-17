@@ -1,0 +1,51 @@
+{
+  "name": "remote-work-sessions",
+  "version": "0.2.0",
+  "description": "Persistent remote work sessions over SSH.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "rws": "bin/rws"
+  },
+  "files": [
+    "bin",
+    "docs",
+    "!docs/verification",
+    "README.md",
+    "README.zh-CN.md",
+    "SECURITY.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "ssh",
+    "remote-development",
+    "persistent-session",
+    "shpool",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "test": "scripts/smoke-test.sh",
+    "test:e2e": "tests/e2e/podman-e2e.sh",
+    "audit": "npm audit --omit=dev --audit-level=moderate",
+    "verify:public": "scripts/verify-public-release.sh --source",
+    "verify:package": "scripts/verify-public-release.sh --package",
+    "test:release": "npm test && npm run audit && npm run verify:package",
+    "prepack": "scripts/verify-public-release.sh --source >/dev/null"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyang214/remote-work-sessions.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hyang214/remote-work-sessions/issues"
+  },
+  "homepage": "https://github.com/hyang214/remote-work-sessions",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

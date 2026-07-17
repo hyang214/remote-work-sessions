@@ -1,0 +1,25 @@
+ARG BASE_IMAGE=alpine:3.22
+FROM ${BASE_IMAGE}
+
+ARG APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
+ARG RWS_PASSWORD=rws-password-123
+
+RUN sed -i "s|http://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories \
+  && sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${APK_MIRROR}|g" /etc/apk/repositories \
+  && apk add --no-cache bash openssh openssh-client git coreutils expect sudo jq
+
+RUN adduser -D -s /bin/bash rws \
+  && echo "rws:${RWS_PASSWORD}" | chpasswd \
+  && mkdir -p /home/rws/.ssh /home/rws/work/project \
+  && chown -R rws:rws /home/rws \
+  && echo 'rws ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/rws \
+  && chmod 440 /etc/sudoers.d/rws \
+  && ssh-keygen -A
+
+COPY tests/e2e/server-entrypoint.sh /usr/local/bin/rws-server-entrypoint
+
+RUN chmod +x /usr/local/bin/rws-server-entrypoint
+
+EXPOSE 22
+
+CMD ["sleep", "infinity"]
